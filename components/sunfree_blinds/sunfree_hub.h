@@ -2,6 +2,7 @@
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
 #include "esphome/core/preferences.h"
+#include "esphome/components/api/custom_api_device.h"
 #include "esphome/components/cc1101/cc1101.h"
 #include "sunfree_protocol.h"
 #include <map>
@@ -27,7 +28,7 @@ static constexpr uint8_t ACTION_GOTO_FAV = 4;
 
 class SunfreeCover;
 
-class SunfreeHub : public Component {
+class SunfreeHub : public Component, public api::CustomAPIDevice {
  public:
   void set_cc1101(cc1101::CC1101Component *radio) { this->radio_ = radio; }
   void set_hub_id(const std::string &id) {
@@ -45,6 +46,10 @@ class SunfreeHub : public Component {
     this->radio_->set_whitening(false);
     ESP_LOGI(TAG, "CC1101: CRC and whitening disabled for Sunfree protocol");
     this->build_solicitation_frame_();
+
+    register_service(&SunfreeHub::on_send_config_, "send_config",
+                     {"motor_id", "action_type"});
+    ESP_LOGI(TAG, "Registered service: send_config(motor_id, action_type)");
   }
 
   void loop() override {
@@ -103,6 +108,45 @@ class SunfreeHub : public Component {
     this->transmit_with_preamble_(pkt);
   }
 
+ protected:
+  void on_send_config_(std::string motor_id, std::string action_type) {
+    uint8_t mid[4];
+    if (motor_id.length() != 8) {
+      ESP_LOGW(TAG, "send_config: motor_id must be 8 hex chars, got '%s'", motor_id.c_str());
+      return;
+    }
+    parse_motor_id(motor_id, mid);
+
+    uint8_t action, value;
+    if (action_type == "direction_forward") {
+      action = static_cast<uint8_t>(SunfreeCmd::SET_DIRECTION);
+      value = DIR_FORWARD;
+    } else if (action_type == "direction_reverse") {
+      action = static_cast<uint8_t>(SunfreeCmd::SET_DIRECTION);
+      value = DIR_REVERSE;
+    } else if (action_type == "set_open_limit") {
+      action = static_cast<uint8_t>(SunfreeCmd::SET_LIMIT);
+      value = LIMIT_OPEN;
+    } else if (action_type == "set_close_limit") {
+      action = static_cast<uint8_t>(SunfreeCmd::SET_LIMIT);
+      value = LIMIT_CLOSE;
+    } else if (action_type == "save_favourite") {
+      action = static_cast<uint8_t>(SunfreeCmd::SET_LIMIT);
+      value = LIMIT_FAVOURITE;
+    } else if (action_type == "goto_favourite") {
+      action = static_cast<uint8_t>(SunfreeCmd::GOTO_FAVOURITE);
+      value = GOTO_FAV_VALUE;
+    } else {
+      ESP_LOGW(TAG, "send_config: unknown action_type '%s'", action_type.c_str());
+      return;
+    }
+
+    ESP_LOGI(TAG, "Service send_config: motor=%s action=%s (0x%02X/0x%02X)",
+             motor_id.c_str(), action_type.c_str(), action, value);
+    this->send_config(mid, action, value);
+  }
+
+ public:
   // Quick TX for piggyback: motor is already awake, skip preamble
   void send_quick(const uint8_t *motor_id, uint8_t action, uint8_t position = 0) {
     uint8_t seq = this->next_seq();

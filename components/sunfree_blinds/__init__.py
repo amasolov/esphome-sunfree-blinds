@@ -4,8 +4,8 @@ from esphome.const import CONF_ID
 from esphome.components.cc1101 import CC1101Component
 
 CODEOWNERS = ["@amasolov"]
-DEPENDENCIES = ["cc1101"]
-AUTO_LOAD = ["cover", "sensor", "button"]
+DEPENDENCIES = ["cc1101", "api"]
+AUTO_LOAD = ["cover", "sensor"]
 
 CONF_HUB_ID = "hub_id"
 CONF_CC1101_ID = "cc1101_id"

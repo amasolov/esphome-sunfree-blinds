@@ -238,42 +238,26 @@ See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the full protocol details.
 ## Motor configuration
 
 After pairing, you can configure each motor's direction, travel limits,
-and favourite position using button entities. These send one-shot RF
-commands -- move the blind to the desired position first, then press the
-button to save that position as a limit or favourite.
+and favourite position via an **HA service** -- no extra YAML needed.
+The hub automatically registers `esphome.<device>_send_config`.
+
+### Usage (HA Developer Tools > Services)
 
 ```yaml
-button:
-  # Set motor direction
-  - platform: sunfree_blinds
-    name: "Night Direction Forward"
-    motor_id: "034a105b"
-    action_type: direction_forward    # or direction_reverse
-
-  # Save current position as open/close limit
-  - platform: sunfree_blinds
-    name: "Night Set Open Limit"
-    motor_id: "034a105b"
-    action_type: set_open_limit       # saves current position as fully-open
-
-  - platform: sunfree_blinds
-    name: "Night Set Close Limit"
-    motor_id: "034a105b"
-    action_type: set_close_limit      # saves current position as fully-closed
-
-  # Favourite position
-  - platform: sunfree_blinds
-    name: "Night Save Favourite"
-    motor_id: "034a105b"
-    action_type: save_favourite       # saves current position as favourite
-
-  - platform: sunfree_blinds
-    name: "Night Go To Favourite"
-    motor_id: "034a105b"
-    action_type: goto_favourite       # moves to saved favourite position
+service: esphome.sunfree_blinds_send_config
+data:
+  motor_id: "034a105b"
+  action_type: "direction_forward"
 ```
 
-Available `action_type` values:
+### Workflow
+
+1. Move the blind to the desired position using the cover controls
+2. Call the service with the appropriate `action_type` to save that
+   position as a limit or favourite
+3. For direction changes, just call the service -- no positioning needed
+
+### Available `action_type` values
 
 | action_type | Description |
 |-------------|-------------|
@@ -311,13 +295,15 @@ Available `action_type` values:
 | `motor_id` | Yes | 4-byte motor identifier (8 hex characters) |
 | `battery` | No | Sub-schema for battery sensor (sensor config) |
 
-### Button (`platform: sunfree_blinds`)
+### Service (`send_config`)
 
-| Key | Required | Description |
-|-----|----------|-------------|
-| `name` | Yes | Entity name in Home Assistant |
-| `motor_id` | Yes | 4-byte motor identifier (8 hex characters) |
-| `action_type` | Yes | One of: `direction_forward`, `direction_reverse`, `set_open_limit`, `set_close_limit`, `save_favourite`, `goto_favourite` |
+Automatically registered -- no YAML config needed. Call via
+`esphome.<device>_send_config` with two string parameters:
+
+| Parameter | Description |
+|-----------|-------------|
+| `motor_id` | 4-byte motor identifier (8 hex characters) |
+| `action_type` | One of: `direction_forward`, `direction_reverse`, `set_open_limit`, `set_close_limit`, `save_favourite`, `goto_favourite` |
 
 ## How it works
 
@@ -371,11 +357,9 @@ components/
   sunfree_blinds/
     __init__.py          ESPHome hub platform (YAML config -> C++ codegen)
     cover.py             ESPHome cover platform (per-motor config)
-    button.py            ESPHome button platform (configuration commands)
     sunfree_protocol.h   Encryption, packet framing, CRC-8, parsers
-    sunfree_hub.h        CC1101 radio control, WOR preamble, piggyback
+    sunfree_hub.h        CC1101 radio control, WOR preamble, config service
     sunfree_cover.h      Cover entity, position mapping, status handling
-    sunfree_button.h     Button entity (direction, limits, favourite)
 example.yaml             Complete working ESPHome configuration
 docs/
   PROTOCOL.md            Full RF protocol specification

@@ -122,33 +122,19 @@ button:
         - lambda: |-
             id(sunfree_hub).stop_scan();
 
-  # --- Motor configuration buttons ---
-  # These send one-shot commands to configure motor direction, limits,
-  # and favourite position.  Duplicate for each motor_id as needed.
-  - platform: sunfree_blinds
-    name: "Night Direction Forward"
-    motor_id: "034a105b"
-    action_type: direction_forward
-  - platform: sunfree_blinds
-    name: "Night Direction Reverse"
-    motor_id: "034a105b"
-    action_type: direction_reverse
-  - platform: sunfree_blinds
-    name: "Night Set Open Limit"
-    motor_id: "034a105b"
-    action_type: set_open_limit
-  - platform: sunfree_blinds
-    name: "Night Set Close Limit"
-    motor_id: "034a105b"
-    action_type: set_close_limit
-  - platform: sunfree_blinds
-    name: "Night Save Favourite"
-    motor_id: "034a105b"
-    action_type: save_favourite
-  - platform: sunfree_blinds
-    name: "Night Go To Favourite"
-    motor_id: "034a105b"
-    action_type: goto_favourite
+# --- Motor configuration ---
+# The hub automatically registers an HA service for motor configuration.
+# No per-motor button entries needed.  Call from HA Developer Tools:
+#
+#   Service: esphome.sunfree_blinds_send_config
+#   Data:
+#     motor_id: "034a105b"
+#     action_type: "direction_forward"
+#
+# Valid action_type values:
+#   direction_forward, direction_reverse,
+#   set_open_limit, set_close_limit,
+#   save_favourite, goto_favourite
 
 # --- Diagnostics ---
 sensor:
