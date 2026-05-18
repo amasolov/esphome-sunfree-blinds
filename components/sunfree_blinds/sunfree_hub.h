@@ -3,6 +3,7 @@
 #include "esphome/core/log.h"
 #include "esphome/core/preferences.h"
 #include "esphome/components/api/custom_api_device.h"
+#include "esphome/components/web_server_base/web_server_base.h"
 #include "esphome/components/cc1101/cc1101.h"
 #include "sunfree_protocol.h"
 #include <map>
@@ -31,6 +32,7 @@ class SunfreeCover;
 class SunfreeHub : public Component, public api::CustomAPIDevice {
  public:
   void set_cc1101(cc1101::CC1101Component *radio) { this->radio_ = radio; }
+  void set_web_base(web_server_base::WebServerBase *base) { this->web_base_ = base; }
   void set_hub_id(const std::string &id) {
     parse_motor_id(id, this->hub_id_);
     this->hub_id_from_yaml_ = true;
@@ -50,6 +52,8 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     register_service(&SunfreeHub::on_send_config_, "send_config",
                      {"motor_id", "action_type"});
     ESP_LOGI(TAG, "Registered service: send_config(motor_id, action_type)");
+
+    if (this->web_base_) this->setup_web_();
   }
 
   void loop() override {
@@ -184,6 +188,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   }
 
   std::string get_hub_id_str() const { return format_motor_id(this->hub_id_); }
+  std::string get_motors_json();  // implemented in sunfree_web.h
 
   uint32_t get_rx_packet_count() const { return this->rx_packet_count_; }
   uint32_t get_rx_valid_count() const { return this->rx_valid_count_; }
@@ -238,6 +243,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
  protected:
   cc1101::CC1101Component *radio_{nullptr};
+  web_server_base::WebServerBase *web_base_{nullptr};
   uint8_t hub_id_[4]{};
   bool hub_id_from_yaml_{false};
   uint8_t seq_{0x80};
@@ -489,6 +495,8 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->radio_->set_packet_length(CC1101_PKT_LEN);
     this->radio_->begin_rx();
   }
+
+  void setup_web_();  // implemented in sunfree_web.h
 };
 
 }  // namespace sunfree_blinds

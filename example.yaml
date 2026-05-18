@@ -21,6 +21,7 @@ logger:
 api:
   encryption:
     key: !secret api_key
+  custom_services: true  # required for send_config service
 
 ota:
   - platform: esphome

@@ -62,6 +62,7 @@ class SunfreeCover : public cover::Cover, public Component {
 
   const uint8_t *get_motor_id() const { return this->motor_id_; }
   const std::string &get_motor_id_str() const { return this->motor_id_str_; }
+  sensor::Sensor *get_battery_sensor() const { return this->battery_sensor_; }
 
   void on_ack(const SunfreeResponse &resp) {
     ESP_LOGI("sunfree", "ACK for %s flags=0x%02x", this->motor_id_str_.c_str(), resp.ack_flags);
@@ -344,3 +345,6 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
 
 }  // namespace sunfree_blinds
 }  // namespace esphome
+
+// Web UI — must come after SunfreeHub and SunfreeCover are fully defined
+#include "sunfree_web.h"

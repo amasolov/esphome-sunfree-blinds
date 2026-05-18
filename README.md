@@ -14,6 +14,7 @@ Replaces the Tuya AC801B cloud hub with a fully local **ESP32 + CC1101** bridge.
 - **Motor pairing** -- pair new motors directly from HA, no Tuya hub needed
 - **Wake-on-Radio (WOR)** -- 800-byte preamble wakes sleeping motors, matching
   the original hub's behavior
+- **Built-in web UI** at `/sunfree` -- control and configure all motors from any browser
 - **No cloud dependency** -- direct 433 MHz RF communication, no internet required
 - **Coexistence** -- can run alongside the original Tuya hub (same hub ID) or
   replace it entirely
@@ -90,7 +91,19 @@ cc1101:
           id(sunfree_hub).on_cc1101_packet(x, rssi);
 ```
 
-### 3. Configure the hub
+### 3. Enable custom services
+
+The component registers an HA service for motor configuration, which
+requires `custom_services: true` in the `api:` section:
+
+```yaml
+api:
+  encryption:
+    key: !secret api_key
+  custom_services: true
+```
+
+### 4. Configure the hub
 
 ```yaml
 sunfree_blinds:
@@ -130,7 +143,7 @@ Once you know your hub ID, you can optionally pin it in the YAML as a
 backup: `hub_id: "a2fb24d8"`. This way, even a full flash erase won't
 require re-pairing.
 
-### 4. Pair your motors
+### 5. Pair your motors
 
 Add the pairing and diagnostic entities to your YAML:
 
@@ -268,6 +281,21 @@ data:
 | `save_favourite` | Save current position as the favourite |
 | `goto_favourite` | Move to the saved favourite position |
 
+## Web UI
+
+The component serves a built-in control page at `http://<device-ip>/sunfree`.
+No extra configuration needed -- it hooks into the existing ESPHome web server.
+
+Features:
+- Live motor list with position and battery status (auto-refreshes)
+- Open / Close / Stop buttons and position slider per motor
+- All configuration commands: direction, limits, favourite
+- Pairing scan start/stop
+
+The JSON API behind the UI is also available for scripting:
+- `GET /sunfree/status` -- hub and motor state as JSON
+- `POST /sunfree/cmd?motor=XXXX&action=open` -- send a command
+
 ## Configuration reference
 
 ### Hub (`sunfree_blinds`)
@@ -360,6 +388,7 @@ components/
     sunfree_protocol.h   Encryption, packet framing, CRC-8, parsers
     sunfree_hub.h        CC1101 radio control, WOR preamble, config service
     sunfree_cover.h      Cover entity, position mapping, status handling
+    sunfree_web.h        Built-in web UI and JSON API handlers
 example.yaml             Complete working ESPHome configuration
 docs/
   PROTOCOL.md            Full RF protocol specification
