@@ -21,7 +21,18 @@ static const int CC1101_PKT_LEN = 29;
 enum class SunfreeCmd : uint8_t {
   STOP = 0x03,
   SET_POSITION = 0x04,
+  GOTO_FAVOURITE = 0x0F,
+  SET_LIMIT = 0x21,
+  SET_DIRECTION = 0x22,
+  DISCOVERY = 0x2D,
 };
+
+static constexpr uint8_t LIMIT_OPEN = 0x01;
+static constexpr uint8_t LIMIT_CLOSE = 0x02;
+static constexpr uint8_t LIMIT_FAVOURITE = 0x03;
+static constexpr uint8_t DIR_FORWARD = 0x00;
+static constexpr uint8_t DIR_REVERSE = 0x01;
+static constexpr uint8_t GOTO_FAV_VALUE = 0x03;
 
 struct SunfreePacket {
   uint8_t seq;
@@ -196,6 +207,37 @@ inline std::vector<uint8_t> build_stop_packet(const uint8_t *hub_id, const uint8
   return build_tx_frame(payload, 15);
 }
 
+// Generic n=4 command: 16 bytes fully XXTEA-encrypted.
+// Used for position, limits, direction, favourite, and other config commands.
+inline std::vector<uint8_t> build_n4_command(const uint8_t *hub_id, const uint8_t *motor_id,
+                                              uint8_t seq, uint8_t action, uint8_t value,
+                                              bool swap = false) {
+  uint8_t plain[16];
+  plain[0] = 0x0B;
+  plain[1] = seq;
+  plain[2] = 0x01;
+  if (swap) {
+    memcpy(plain + 3, motor_id, 4);
+    memcpy(plain + 7, hub_id, 4);
+  } else {
+    memcpy(plain + 3, hub_id, 4);
+    memcpy(plain + 7, motor_id, 4);
+  }
+  plain[11] = 0x00;
+  plain[12] = 0x00;
+  plain[13] = 0x01;
+  plain[14] = action;
+  plain[15] = value;
+
+  uint32_t words[4];
+  memcpy(words, plain, 16);
+  xxtea_encrypt(words, 4, SUNFREE_KEY);
+
+  uint8_t payload[16];
+  memcpy(payload, words, 16);
+  return build_tx_frame(payload, 16);
+}
+
 inline std::vector<uint8_t> build_position_packet(const uint8_t *hub_id, const uint8_t *motor_id,
                                                    uint8_t seq, uint8_t position, bool swap = false) {
   uint8_t plain[16];
@@ -317,6 +359,81 @@ inline bool parse_status(const uint8_t *cc, int cc_len, SunfreeResponse &resp) {
   resp.state = dec[15];
   resp.position = dec[22];
   resp.battery = dec[19];
+  resp.valid = true;
+  return true;
+}
+
+// =========================================================================
+// Pairing: discovery packet builder
+//
+// Captured from Tuya hub pairing session. The discovery packet is a
+// stop-style command (n=3 XXTEA, 12 enc + 4 clear) addressed to
+// broadcast (motor=00000000) with ACTION=0x2D:
+//
+//   Plaintext: 0B seq 01 hub_id[4] 00000000 00 | 00 01 2D value
+//   Encrypted: XXTEA(first 12 bytes, n=3) | last 4 bytes cleartext
+// =========================================================================
+
+inline std::vector<uint8_t> build_discovery_packet(const uint8_t *hub_id, uint8_t seq) {
+  uint8_t plain[12];
+  plain[0] = 0x0B;
+  plain[1] = seq;
+  plain[2] = 0x01;  // CMD class 1 (same as normal commands)
+  memcpy(plain + 3, hub_id, 4);
+  memset(plain + 7, 0, 4);  // broadcast motor address
+  plain[11] = 0x00;
+
+  uint32_t words[3];
+  memcpy(words, plain, 12);
+  xxtea_encrypt(words, 3, SUNFREE_KEY);
+
+  uint8_t payload[15];
+  memcpy(payload, words, 12);
+  payload[12] = 0x00;
+  payload[13] = 0x01;
+  payload[14] = 0x2D;  // discovery action code
+
+  return build_tx_frame(payload, 15);
+}
+
+// Motor pairing response: 20 bytes, XXTEA n=4 (first 16 bytes) + 4 cleartext.
+// Captured from real pairing session:
+//   Decrypted: 0B 00 02 night_id[4] hub_id[4] 00 00 01 2F day_first_byte | day_last3[3] tail
+// Contains both motor IDs (night + day) in a single response.
+struct SunfreePairingResponse {
+  uint8_t raw[20];
+  uint8_t night_id[4];   // first motor ID (night/roller A)
+  uint8_t day_id[4];     // second motor ID (day/roller B)
+  uint8_t hub_id[4];     // hub ID the motor paired with
+  bool valid{false};
+};
+
+inline bool parse_pairing_response(const uint8_t *cc, int cc_len, SunfreePairingResponse &resp) {
+  int len = d492_get_len(cc, cc_len);
+  if (len != 20) return false;
+
+  uint8_t data[20];
+  if (!d492_extract_payload(cc, cc_len, data, 20)) return false;
+  memcpy(resp.raw, data, 20);
+
+  // Decrypt first 16 bytes with XXTEA n=4, last 4 bytes are cleartext
+  uint32_t words[4];
+  memcpy(words, data, 16);
+  xxtea_decrypt(words, 4, SUNFREE_KEY);
+  uint8_t dec[20];
+  memcpy(dec, words, 16);
+  memcpy(dec + 16, data + 16, 4);  // cleartext tail
+
+  if (dec[0] != 0x0B || dec[2] != 0x02) return false;
+
+  // Night motor ID at bytes 3-6
+  memcpy(resp.night_id, dec + 3, 4);
+  // Hub ID at bytes 7-10
+  memcpy(resp.hub_id, dec + 7, 4);
+  // Day motor ID: first byte at dec[15], last 3 bytes at dec[16-18]
+  resp.day_id[0] = dec[15];
+  memcpy(resp.day_id + 1, dec + 16, 3);
+
   resp.valid = true;
   return true;
 }

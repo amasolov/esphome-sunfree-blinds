@@ -118,6 +118,8 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
     ESP_LOGW(TAG, "Piggyback expired after %dms", PIGGYBACK_TIMEOUT_MS);
   }
 
+  // Scan timeout is now handled in loop()
+
   int n = data.size() < 29 ? data.size() : 29;
   char hex[29 * 3 + 1];
   for (int i = 0; i < n; i++) snprintf(hex + i * 3, 4, "%02x ", data[i]);
@@ -204,17 +206,58 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
     } else {
       uint8_t extracted[16];
       d492_extract_payload(data.data(), data.size(), extracted, 16);
+
+      // Check for beacon: byte 14 = 0xEE in RAW cleartext (n=3 encryption,
+      // bytes 12-15 are unencrypted — like STOP commands) OR in n=4 decrypt
+      bool is_beacon = (extracted[14] == 0xEE);
+
       uint32_t w4[4];
       memcpy(w4, extracted, 16);
       xxtea_decrypt(w4, 4, SUNFREE_KEY);
       uint8_t d4[16];
       memcpy(d4, w4, 16);
+
+      if (!is_beacon) is_beacon = (d4[14] == 0xEE);
+
       char hx[16 * 3 + 1];
       for (int i = 0; i < 16; i++) snprintf(hx + i * 3, 4, "%02x ", d4[i]);
-      ESP_LOGW(TAG, "CMD parse_fail dec4: %s rssi=%.0f", hx, rssi);
-      char buf[120];
-      snprintf(buf, sizeof(buf), "CMD fail dec=%s", hx);
-      this->last_rx_info_ = buf;
+
+      if (is_beacon) {
+        this->rx_beacon_count_++;
+        this->rx_cmd_count_--;
+
+        char raw_hx[16 * 3 + 1];
+        for (int i = 0; i < 16; i++) snprintf(raw_hx + i * 3, 4, "%02x ", extracted[i]);
+        ESP_LOGI(TAG, "PAIRING BEACON: raw=%s dec4=%s rssi=%.0f", raw_hx, hx, rssi);
+        ESP_LOGI(TAG, "BEACON raw[14]=0x%02x dec4[14]=0x%02x", extracted[14], d4[14]);
+
+        // Also try n=3 decrypt (first 12 bytes only) for proper address extraction
+        uint8_t d3[16];
+        memcpy(d3, extracted, 16);
+        uint32_t w3[3];
+        memcpy(w3, d3, 12);
+        xxtea_decrypt(w3, 3, SUNFREE_KEY);
+        memcpy(d3, w3, 12);  // bytes 12-15 stay as cleartext
+        char d3_hx[16 * 3 + 1];
+        for (int i = 0; i < 16; i++) snprintf(d3_hx + i * 3, 4, "%02x ", d3[i]);
+        ESP_LOGI(TAG, "BEACON dec3=%s", d3_hx);
+
+        char buf[120];
+        snprintf(buf, sizeof(buf), "BEACON raw14=0x%02x dec4=%s", extracted[14], hx);
+        this->last_rx_info_ = buf;
+
+        if (this->scan_active_) {
+          this->pairing_status_ = "BEACON FOUND";
+          ESP_LOGI(TAG, "PAIRING: beacon found! Sending response...");
+          // Try n=3 decrypted data for address (bytes 3-6)
+          this->send_pairing_response(d3);
+        }
+      } else {
+        ESP_LOGW(TAG, "CMD parse_fail dec4: %s rssi=%.0f", hx, rssi);
+        char buf[120];
+        snprintf(buf, sizeof(buf), "CMD fail dec=%s", hx);
+        this->last_rx_info_ = buf;
+      }
     }
 
     // Don't fire piggyback on CMD — motor is busy processing the hub's
@@ -263,6 +306,38 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
       char buf[120];
       snprintf(buf, sizeof(buf), "STATUS parse_fail raw=%s", hx);
       this->last_rx_info_ = buf;
+    }
+
+  } else if (pkt_len == 20) {
+    // Motor pairing response (20 bytes: n=4 encrypted + 4 cleartext)
+    this->rx_beacon_count_++;
+    SunfreePairingResponse pr{};
+    if (parse_pairing_response(data.data(), data.size(), pr)) {
+      std::string night = format_motor_id(pr.night_id);
+      std::string day = format_motor_id(pr.day_id);
+      std::string hid = format_motor_id(pr.hub_id);
+      ESP_LOGI(TAG, "PAIRING RESPONSE: night=%s day=%s hub=%s rssi=%.0f",
+               night.c_str(), day.c_str(), hid.c_str(), rssi);
+
+      char buf[120];
+      snprintf(buf, sizeof(buf), "PAIRED night=%s day=%s hub=%s",
+               night.c_str(), day.c_str(), hid.c_str());
+      this->last_rx_info_ = buf;
+
+      if (this->scan_active_) {
+        this->scan_active_ = false;
+        char pbuf[120];
+        snprintf(pbuf, sizeof(pbuf), "PAIRED! night=%s day=%s", night.c_str(), day.c_str());
+        this->pairing_status_ = pbuf;
+        ESP_LOGI(TAG, "PAIRING SUCCESS: night=%s day=%s", night.c_str(), day.c_str());
+      }
+    } else {
+      // Log raw for analysis
+      uint8_t raw20[20];
+      d492_extract_payload(data.data(), data.size(), raw20, 20);
+      char hex[20 * 3 + 1];
+      for (int i = 0; i < 20; i++) snprintf(hex + i * 3, 4, "%02x ", raw20[i]);
+      ESP_LOGW(TAG, "20-byte parse_fail raw: %s rssi=%.0f", hex, rssi);
     }
   }
 }

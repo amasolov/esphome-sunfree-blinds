@@ -3,7 +3,7 @@
 # 1. Copy this file and rename it (e.g. sunfree-blinds.yaml).
 # 2. Create a secrets.yaml next to it with wifi_ssid, wifi_password,
 #    api_key (base64, 32 bytes), and ota_password.
-# 3. Replace hub_id and motor_id values with your own (see README).
+# 3. Pair your motors (see Pairing section below), then add motor_id values.
 # 4. Adjust GPIO pins if your wiring differs from the reference.
 
 esphome:
@@ -41,7 +41,8 @@ web_server:
 
 # Load the sunfree_blinds component from this repository.
 # If you cloned locally, use:  {type: local, path: components}
-# If using from GitHub, use:   {type: git, url: https://github.com/YOUR_USER/esphome-sunfree-blinds}
+# If using from GitHub:
+#   {type: git, url: https://github.com/amasolov/esphome-sunfree-blinds}
 external_components:
   - source: {type: local, path: components}
     components: [sunfree_blinds]
@@ -57,15 +58,15 @@ cc1101:
   id: cc1101_radio
   cs_pin: GPIO5
   gdo0_pin: GPIO4
-  frequency: 433.95MHz       # RX frequency (motor transmits here)
+  frequency: 433.95MHz
   modulation_type: GFSK
-  symbol_rate: 40000          # 40 kbps
+  symbol_rate: 40000
   fsk_deviation: 38kHz
   filter_bandwidth: 203kHz
   packet_mode: true
-  packet_length: 29           # captures full status reports
+  packet_length: 29
   sync_mode: "16/16"
-  sync1: 0xD4                 # partial sync match within CMT2300A's "SRJD"
+  sync1: 0xD4
   sync0: 0x92
   num_preamble: 7
   on_packet:
@@ -74,35 +75,82 @@ cc1101:
           id(sunfree_hub).on_cc1101_packet(x, rssi);
 
 # --- Sunfree hub ---
-# hub_id: the 4-byte hub identifier your motors are paired to.
-# If migrating from a Tuya AC801B hub, use its hub ID so the motors
-# accept commands without re-pairing.
+# hub_id is optional. If omitted, a random 4-byte ID is generated on first
+# boot and stored in NVS. If migrating from a Tuya AC801B hub, set hub_id
+# to its ID so existing motors accept commands without re-pairing.
 sunfree_blinds:
   id: sunfree_hub
-  hub_id: "15241342"          # <-- replace with YOUR hub ID (8 hex chars)
+  # hub_id: "15241342"        # uncomment to use a specific hub ID
   cc1101_id: cc1101_radio
 
 # --- Blind motors ---
 # Each physical Sunfree AC2001-15D unit has TWO rollers (night + day),
 # each with its own motor_id.  Add one cover entry per roller.
+# Use the pairing scan (below) to discover motor IDs.
 cover:
   - platform: sunfree_blinds
     name: "Office Night Blind"
-    motor_id: "04250e5b"      # <-- replace with your night-roller motor ID
+    motor_id: "034a105b"      # <-- replace with your night-roller motor ID
     battery:
       name: "Office Night Blind Battery"
 
   - platform: sunfree_blinds
     name: "Office Day Blind"
-    motor_id: "05250e5b"      # <-- replace with your day-roller motor ID
+    motor_id: "044a105b"      # <-- replace with your day-roller motor ID
     battery:
       name: "Office Day Blind Battery"
 
-# --- Diagnostics (optional, useful for debugging) ---
+# --- Pairing ---
+# Press "Start Pairing Scan" in HA, then press the M button on the motor.
+# The motor IDs appear in the "Pairing Status" text sensor.
+# Add them to the cover section above and reflash.
 button:
   - platform: restart
     name: "Restart"
 
+  - platform: template
+    name: "Start Pairing Scan"
+    on_press:
+      then:
+        - lambda: |-
+            id(sunfree_hub).start_scan();
+
+  - platform: template
+    name: "Stop Pairing Scan"
+    on_press:
+      then:
+        - lambda: |-
+            id(sunfree_hub).stop_scan();
+
+  # --- Motor configuration buttons ---
+  # These send one-shot commands to configure motor direction, limits,
+  # and favourite position.  Duplicate for each motor_id as needed.
+  - platform: sunfree_blinds
+    name: "Night Direction Forward"
+    motor_id: "034a105b"
+    action_type: direction_forward
+  - platform: sunfree_blinds
+    name: "Night Direction Reverse"
+    motor_id: "034a105b"
+    action_type: direction_reverse
+  - platform: sunfree_blinds
+    name: "Night Set Open Limit"
+    motor_id: "034a105b"
+    action_type: set_open_limit
+  - platform: sunfree_blinds
+    name: "Night Set Close Limit"
+    motor_id: "034a105b"
+    action_type: set_close_limit
+  - platform: sunfree_blinds
+    name: "Night Save Favourite"
+    motor_id: "034a105b"
+    action_type: save_favourite
+  - platform: sunfree_blinds
+    name: "Night Go To Favourite"
+    motor_id: "034a105b"
+    action_type: goto_favourite
+
+# --- Diagnostics ---
 sensor:
   - platform: wifi_signal
     name: "WiFi Signal"
@@ -120,7 +168,19 @@ sensor:
     lambda: |-
       return id(sunfree_hub).get_rx_ack_count();
 
+  - platform: template
+    name: "RX Beacon Count"
+    update_interval: 5s
+    lambda: |-
+      return id(sunfree_hub).get_rx_beacon_count();
+
 text_sensor:
+  - platform: template
+    name: "Hub ID"
+    update_interval: 60s
+    lambda: |-
+      return id(sunfree_hub).get_hub_id_str();
+
   - platform: template
     name: "Last RX Info"
     update_interval: 10s
@@ -132,3 +192,9 @@ text_sensor:
     update_interval: 10s
     lambda: |-
       return id(sunfree_hub).get_piggyback_status();
+
+  - platform: template
+    name: "Pairing Status"
+    update_interval: 5s
+    lambda: |-
+      return id(sunfree_hub).get_pairing_status();

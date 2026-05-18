@@ -6,9 +6,12 @@ Replaces the Tuya AC801B cloud hub with a fully local **ESP32 + CC1101** bridge.
 ## Features
 
 - **Open / Close / Stop / Set Position** with precise percentage control
+- **Motor configuration** -- set direction (forward/reverse), open/close limits,
+  and favourite position directly from Home Assistant
 - **Battery state of charge** reported as a Home Assistant sensor
 - **Dual-roller support** -- each Sunfree unit has independent day and night
   rollers, exposed as separate cover entities
+- **Motor pairing** -- pair new motors directly from HA, no Tuya hub needed
 - **Wake-on-Radio (WOR)** -- 800-byte preamble wakes sleeping motors, matching
   the original hub's behavior
 - **No cloud dependency** -- direct 433 MHz RF communication, no internet required
@@ -46,7 +49,7 @@ Add this to your ESPHome YAML:
 
 ```yaml
 external_components:
-  - source: {type: git, url: https://github.com/YOUR_USER/esphome-sunfree-blinds}
+  - source: {type: git, url: https://github.com/amasolov/esphome-sunfree-blinds}
     components: [sunfree_blinds]
 ```
 
@@ -87,24 +90,95 @@ cc1101:
           id(sunfree_hub).on_cc1101_packet(x, rssi);
 ```
 
-### 3. Configure the hub and motors
+### 3. Configure the hub
 
 ```yaml
 sunfree_blinds:
   id: sunfree_hub
-  hub_id: "15241342"        # your hub's 4-byte ID (8 hex chars)
+  # hub_id is optional — a random 4-byte ID is generated on first boot
+  # and stored in NVS (Non-Volatile Storage). It persists across reboots
+  # and OTA reflashes. Set it explicitly only when migrating from a Tuya
+  # AC801B hub, or to pin it for disaster recovery.
+  # hub_id: "15241342"
   cc1101_id: cc1101_radio
+```
 
+#### Hub ID persistence
+
+When `hub_id` is omitted, the component generates a random 4-byte ID on
+first boot and saves it to NVS. This ID:
+
+- **Survives reboots and OTA updates** -- NVS is a separate flash
+  partition from the application firmware
+- **Survives config changes** -- the NVS key is based on a fixed string,
+  not the device name or YAML content
+- **Is lost on full flash erase** (`esphome run` with `--erase-flash`,
+  or `idf.py erase-flash`) -- a new ID will be generated and all motors
+  must be re-paired
+
+To see your hub ID, add this text sensor:
+
+```yaml
+text_sensor:
+  - platform: template
+    name: "Hub ID"
+    update_interval: 60s
+    lambda: return id(sunfree_hub).get_hub_id_str();
+```
+
+Once you know your hub ID, you can optionally pin it in the YAML as a
+backup: `hub_id: "a2fb24d8"`. This way, even a full flash erase won't
+require re-pairing.
+
+### 4. Pair your motors
+
+Add the pairing and diagnostic entities to your YAML:
+
+```yaml
+button:
+  - platform: template
+    name: "Start Pairing Scan"
+    on_press:
+      then:
+        - lambda: id(sunfree_hub).start_scan();
+
+  - platform: template
+    name: "Stop Pairing Scan"
+    on_press:
+      then:
+        - lambda: id(sunfree_hub).stop_scan();
+
+text_sensor:
+  - platform: template
+    name: "Hub ID"
+    update_interval: 60s
+    lambda: return id(sunfree_hub).get_hub_id_str();
+
+  - platform: template
+    name: "Pairing Status"
+    update_interval: 5s
+    lambda: return id(sunfree_hub).get_pairing_status();
+```
+
+Then:
+1. Flash and boot the ESP32
+2. Check the **Hub ID** sensor to confirm your hub identity
+3. Press **Start Pairing Scan** in Home Assistant
+4. Press the **M button** on the motor (within 10 seconds)
+5. The "Pairing Status" sensor shows: `PAIRED! night=XXXXXXXX day=YYYYYYYY`
+6. Add the motor IDs to your YAML:
+
+```yaml
 cover:
   - platform: sunfree_blinds
     name: "Office Night Blind"
-    motor_id: "04250e5b"    # night roller motor ID
+    motor_id: "XXXXXXXX"    # night roller motor ID from pairing
     battery:
       name: "Office Night Battery"
 
   - platform: sunfree_blinds
     name: "Office Day Blind"
-    motor_id: "05250e5b"    # day roller motor ID
+    motor_id: "YYYYYYYY"    # day roller motor ID from pairing
     battery:
       name: "Office Day Battery"
 ```
@@ -148,11 +222,67 @@ Each Sunfree AC2001-15D unit registers **two** motor IDs when paired:
 
 Example: night = `04250e5b`, day = `05250e5b`.
 
-### Pairing new motors (not yet implemented)
+### Pairing new motors
 
-Pairing new motors directly from the ESP32 (without a Tuya hub) is
-documented in [docs/PROTOCOL.md](docs/PROTOCOL.md) but not yet
-implemented in the component. Contributions welcome.
+Pairing is fully supported directly from the ESP32 — no Tuya hub needed.
+
+1. Press **Start Pairing Scan** in HA (the ESP32 begins transmitting
+   discovery packets every 1.5 seconds)
+2. Press the **M button** on the motor — it enters listen mode for ~10s
+3. The motor hears the ESP32's discovery and responds with both motor IDs
+4. The **Pairing Status** sensor shows: `PAIRED! night=XXXXXXXX day=YYYYYYYY`
+5. Add the IDs to your YAML and reflash
+
+See [docs/PROTOCOL.md](docs/PROTOCOL.md) for the full protocol details.
+
+## Motor configuration
+
+After pairing, you can configure each motor's direction, travel limits,
+and favourite position using button entities. These send one-shot RF
+commands -- move the blind to the desired position first, then press the
+button to save that position as a limit or favourite.
+
+```yaml
+button:
+  # Set motor direction
+  - platform: sunfree_blinds
+    name: "Night Direction Forward"
+    motor_id: "034a105b"
+    action_type: direction_forward    # or direction_reverse
+
+  # Save current position as open/close limit
+  - platform: sunfree_blinds
+    name: "Night Set Open Limit"
+    motor_id: "034a105b"
+    action_type: set_open_limit       # saves current position as fully-open
+
+  - platform: sunfree_blinds
+    name: "Night Set Close Limit"
+    motor_id: "034a105b"
+    action_type: set_close_limit      # saves current position as fully-closed
+
+  # Favourite position
+  - platform: sunfree_blinds
+    name: "Night Save Favourite"
+    motor_id: "034a105b"
+    action_type: save_favourite       # saves current position as favourite
+
+  - platform: sunfree_blinds
+    name: "Night Go To Favourite"
+    motor_id: "034a105b"
+    action_type: goto_favourite       # moves to saved favourite position
+```
+
+Available `action_type` values:
+
+| action_type | Description |
+|-------------|-------------|
+| `direction_forward` | Set motor direction to forward |
+| `direction_reverse` | Set motor direction to reverse |
+| `set_open_limit` | Save current position as the open limit |
+| `set_close_limit` | Save current position as the close limit |
+| `save_favourite` | Save current position as the favourite |
+| `goto_favourite` | Move to the saved favourite position |
 
 ## Configuration reference
 
@@ -161,8 +291,17 @@ implemented in the component. Contributions welcome.
 | Key | Required | Description |
 |-----|----------|-------------|
 | `id` | Yes | ESPHome component ID |
-| `hub_id` | Yes | 4-byte hub identifier (8 hex characters) |
+| `hub_id` | No | 4-byte hub identifier (8 hex characters). If omitted, a random ID is generated on first boot and persisted in NVS. |
 | `cc1101_id` | Yes | ID of the CC1101 component |
+
+**Runtime accessors** (for use in template sensors/lambdas):
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `get_hub_id_str()` | `std::string` | Current hub ID as 8-char hex string |
+| `get_pairing_status()` | `std::string` | Pairing scan status (idle / SCANNING / PAIRED) |
+| `start_scan()` | `void` | Begin pairing discovery (120s timeout) |
+| `stop_scan()` | `void` | Cancel active pairing scan |
 
 ### Cover (`platform: sunfree_blinds`)
 
@@ -171,6 +310,14 @@ implemented in the component. Contributions welcome.
 | `name` | Yes | Entity name in Home Assistant |
 | `motor_id` | Yes | 4-byte motor identifier (8 hex characters) |
 | `battery` | No | Sub-schema for battery sensor (sensor config) |
+
+### Button (`platform: sunfree_blinds`)
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `name` | Yes | Entity name in Home Assistant |
+| `motor_id` | Yes | 4-byte motor identifier (8 hex characters) |
+| `action_type` | Yes | One of: `direction_forward`, `direction_reverse`, `set_open_limit`, `set_close_limit`, `save_favourite`, `goto_favourite` |
 
 ## How it works
 
@@ -224,9 +371,11 @@ components/
   sunfree_blinds/
     __init__.py          ESPHome hub platform (YAML config -> C++ codegen)
     cover.py             ESPHome cover platform (per-motor config)
+    button.py            ESPHome button platform (configuration commands)
     sunfree_protocol.h   Encryption, packet framing, CRC-8, parsers
     sunfree_hub.h        CC1101 radio control, WOR preamble, piggyback
     sunfree_cover.h      Cover entity, position mapping, status handling
+    sunfree_button.h     Button entity (direction, limits, favourite)
 example.yaml             Complete working ESPHome configuration
 docs/
   PROTOCOL.md            Full RF protocol specification

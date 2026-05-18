@@ -32,8 +32,22 @@ LEN  SEQ  CMD  ADDRESS  FLG  00   DP   ACT  VAL
 | BB    | FLAGS   | Flags (0x00 for normal commands) |
 | BC    | -       | Always 0x00 for cover commands |
 | BD    | DP      | Tuya DP (data point): 0x01 = cover control |
-| BE    | ACTION  | 0x03 = stop, 0x04 = set position |
-| BF    | VALUE   | Position: 0x00 = open, 0x64 = close (100%) |
+| BE    | ACTION  | See action codes table below |
+| BF    | VALUE   | Action-dependent value |
+
+### Action codes
+
+| ACTION | Name | VALUE | XXTEA blocks | Description |
+|--------|------|-------|--------------|-------------|
+| 0x03 | STOP | 0xB7 (fixed) | n=3 (12 enc + 4 clear) | Stop motor |
+| 0x04 | SET_POSITION | 0x00-0x64 | n=4 (16 enc) | Set position (0=open, 100=close) |
+| 0x0F | GOTO_FAVOURITE | 0x03 | n=4 (16 enc) | Move to saved favourite position |
+| 0x21 | SET_LIMIT | 0x01 | n=4 (16 enc) | Save current position as **open limit** |
+| 0x21 | SET_LIMIT | 0x02 | n=4 (16 enc) | Save current position as **close limit** |
+| 0x21 | SET_LIMIT | 0x03 | n=4 (16 enc) | Save current position as **favourite** |
+| 0x22 | SET_DIRECTION | 0x00 | n=4 (16 enc) | Motor direction = **forward** |
+| 0x22 | SET_DIRECTION | 0x01 | n=4 (16 enc) | Motor direction = **reverse** |
+| 0x2D | DISCOVERY | n/a | n=3 (12 enc + 3 clear) | Pairing discovery (broadcast) |
 
 ## Encryption scope
 
@@ -216,16 +230,62 @@ To control existing Tuya-paired motors from ESP32+CC1101:
 
 ### Pairing new motors (ESP32 as hub)
 
-1. ESP32 generates a unique 4-byte hub ID (stored in NVS)
-2. Motor enters pairing mode (hold M button → motor jogs)
-3. Motor broadcasts discovery: CMD class 0, byte 14 = `0xEE`
-4. ESP32 responds with encrypted JSON payload:
-   `{"sub_id":"<id>","pid":"<product_id>","ver":"1.0.0"}`
-5. Motor stores the ESP32's hub ID and confirms
-6. ESP32 receives **two motor IDs** (night + day, first byte differs by 1)
-7. ESP32 stores both IDs in NVS → creates two cover entities
+The motor enters **LISTEN mode** after pressing M (it does NOT broadcast).
+The hub must actively send discovery packets for the motor to hear.
+
+#### Discovery packet (hub → motor)
+
+A stop-style command (n=3 XXTEA, 12 bytes encrypted + 3 bytes cleartext)
+addressed to broadcast (motor = `00000000`) with **ACTION = 0x2D**:
+
+```
+Plaintext: 0B seq 01 hub_id[4] 00000000 00 | 00 01 2D
+Encrypted: XXTEA(first 12 bytes, n=3)     | cleartext tail
+```
+
+The hub sends this repeatedly (every ~1.5s) with full 160ms WOR preamble
+during the scan window. The motor's listen window after pressing M is ~10s.
+
+#### Motor pairing response (motor → hub)
+
+A 20-byte packet (type 0x05 in D492 framing): first 16 bytes XXTEA n=4
+encrypted, last 4 bytes cleartext. Contains **both** motor IDs:
+
+```
+Decrypted: 0B 00 02 night_id[4] hub_id[4] 00 00 01 2F day_first | day_last3[3] tail
+```
+
+| Bytes | Content |
+|-------|---------|
+| 0 | 0x0B (header) |
+| 1 | 0x00 (seq) |
+| 2 | 0x02 (pairing response CMD class) |
+| 3-6 | Night motor ID (roller A) |
+| 7-10 | Hub ID (echoed back) |
+| 15 | First byte of day motor ID |
+| 16-18 | Last 3 bytes of day motor ID (cleartext) |
+
+#### Pairing flow
+
+1. ESP32 generates a unique 4-byte hub ID (stored in NVS on first boot)
+2. User presses "Start Pairing Scan" in HA → ESP32 begins sending
+   ACTION=0x2D discovery packets with full WOR preamble every 1.5s
+3. User presses M button on motor → motor enters listen mode (~10s)
+4. Motor hears the discovery, stores the ESP32's hub ID
+5. Motor responds with 20-byte pairing response containing both motor IDs
+6. ESP32 receives response, extracts night + day motor IDs
+7. User adds the motor IDs to their ESPHome YAML configuration
 
 Maximum 30 motor IDs per hub (firmware limit `0x1E` = 15 physical units).
+
+#### Post-pairing commands (observed from Tuya hub)
+
+After the initial discovery+response, the Tuya hub sends additional
+commands with actions 0x2A, 0x2C addressed to each motor ID. These
+appear to be configuration/parameter-setting commands. The motor
+responds with ACKs and STATUS reports. These are not required for
+basic operation — the motor accepts OPEN/CLOSE/STOP immediately
+after pairing.
 
 ## RF layer
 

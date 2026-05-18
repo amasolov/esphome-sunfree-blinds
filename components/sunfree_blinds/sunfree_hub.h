@@ -1,6 +1,7 @@
 #pragma once
 #include "esphome/core/component.h"
 #include "esphome/core/log.h"
+#include "esphome/core/preferences.h"
 #include "esphome/components/cc1101/cc1101.h"
 #include "sunfree_protocol.h"
 #include <map>
@@ -8,34 +9,69 @@
 #include "driver/gpio.h"
 #include "rom/ets_sys.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 
 namespace esphome {
 namespace sunfree_blinds {
 
 static const char *const TAG = "sunfree";
 
-// action codes for pending commands
+// action codes for pending cover commands
 static constexpr uint8_t ACTION_NONE = 0xFF;
 static constexpr uint8_t ACTION_STOP = 0;
 static constexpr uint8_t ACTION_OPEN = 1;
 static constexpr uint8_t ACTION_CLOSE = 2;
 static constexpr uint8_t ACTION_POSITION = 3;
+// config action codes (for send_config)
+static constexpr uint8_t ACTION_GOTO_FAV = 4;
 
 class SunfreeCover;
 
 class SunfreeHub : public Component {
  public:
   void set_cc1101(cc1101::CC1101Component *radio) { this->radio_ = radio; }
-  void set_hub_id(const std::string &id) { parse_motor_id(id, this->hub_id_); }
+  void set_hub_id(const std::string &id) {
+    parse_motor_id(id, this->hub_id_);
+    this->hub_id_from_yaml_ = true;
+  }
 
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
 
   void setup() override {
+    this->init_hub_id_();
     ESP_LOGI(TAG, "Hub ID: %s", format_motor_id(this->hub_id_).c_str());
     ESP_LOGI(TAG, "Registered %d cover(s)", this->covers_.size());
     this->radio_->set_crc_enable(false);
     this->radio_->set_whitening(false);
     ESP_LOGI(TAG, "CC1101: CRC and whitening disabled for Sunfree protocol");
+    this->build_solicitation_frame_();
+  }
+
+  void loop() override {
+    if (!this->scan_active_) return;
+
+    uint32_t now = millis();
+
+    // Check scan timeout
+    if (now - this->scan_start_ms_ > SCAN_TIMEOUT_MS) {
+      this->scan_active_ = false;
+      this->pairing_status_ = "SCAN TIMEOUT";
+      ESP_LOGW(TAG, "Pairing scan timed out after %ds", SCAN_TIMEOUT_MS / 1000);
+      return;
+    }
+
+    // Send discovery packet every SOLICIT_INTERVAL_MS while scanning.
+    // The motor enters LISTEN mode after M button press (~10s window).
+    // The hub (us) must be actively sending for the motor to hear us.
+    if (now - this->last_solicit_ms_ >= SOLICIT_INTERVAL_MS) {
+      this->last_solicit_ms_ = now;
+      this->solicit_count_++;
+      // Rebuild with fresh seq each time (motor may deduplicate by seq)
+      this->build_solicitation_frame_();
+      ESP_LOGI(TAG, "Pairing TX #%d seq=0x%02x (t=%ds)", this->solicit_count_,
+               this->seq_, (now - this->scan_start_ms_) / 1000);
+      this->transmit_with_preamble_(this->solicit_frame_);
+    }
   }
 
   void register_cover(SunfreeCover *cover);
@@ -54,6 +90,17 @@ class SunfreeHub : public Component {
 
     // Also arm auto-piggyback as fallback for deep-sleeping motors
     this->arm_piggyback_(motor_id, action, position);
+  }
+
+  // Send a configuration command (limits, direction, favourite, etc.)
+  // Uses n=4 XXTEA encryption with arbitrary action+value bytes.
+  void send_config(const uint8_t *motor_id, uint8_t action, uint8_t value) {
+    uint8_t seq = this->next_seq();
+    std::vector<uint8_t> pkt = build_n4_command(
+        this->hub_id_, motor_id, seq, action, value, this->swap_fields_);
+    ESP_LOGI(TAG, "TX CONFIG action=0x%02x value=0x%02x seq=0x%02x motor=%s",
+             action, value, seq, format_motor_id(motor_id).c_str());
+    this->transmit_with_preamble_(pkt);
   }
 
   // Quick TX for piggyback: motor is already awake, skip preamble
@@ -92,6 +139,8 @@ class SunfreeHub : public Component {
     this->piggyback_status_ = "REPLAYED";
   }
 
+  std::string get_hub_id_str() const { return format_motor_id(this->hub_id_); }
+
   uint32_t get_rx_packet_count() const { return this->rx_packet_count_; }
   uint32_t get_rx_valid_count() const { return this->rx_valid_count_; }
   uint32_t get_rx_status_count() const { return this->rx_status_count_; }
@@ -104,9 +153,49 @@ class SunfreeHub : public Component {
 
   void on_cc1101_packet(const std::vector<uint8_t> &data, float rssi);
 
+  // Scan / pairing
+  void start_scan() {
+    this->scan_active_ = true;
+    this->scan_start_ms_ = millis();
+    this->last_solicit_ms_ = 0;  // force immediate first TX
+    this->solicit_count_ = 0;
+    this->pairing_status_ = "SCANNING+TX...";
+    ESP_LOGI(TAG, "Pairing scan STARTED: sending solicitation every %dms for %ds",
+             SOLICIT_INTERVAL_MS, SCAN_TIMEOUT_MS / 1000);
+  }
+
+  void stop_scan() {
+    this->scan_active_ = false;
+    if (this->pairing_status_ == "SCANNING...")
+      this->pairing_status_ = "STOPPED";
+    ESP_LOGI(TAG, "Pairing scan STOPPED");
+  }
+
+  bool is_scanning() const { return this->scan_active_; }
+  const std::string &get_pairing_status() const { return this->pairing_status_; }
+  uint32_t get_rx_beacon_count() const { return this->rx_beacon_count_; }
+
+  // Proactive pairing: now just an alias for start_scan().
+  // The loop() continuously sends solicitation + listens during scan.
+  void send_pairing_solicitation() {
+    this->start_scan();
+  }
+
+  void send_pairing_response(const uint8_t *resp_dec16) {
+    // Motor responded to our discovery. Extract motor address from bytes 3-6.
+    const uint8_t *motor_addr = resp_dec16 + 3;
+    char mid[20];
+    snprintf(mid, sizeof(mid), "%02x%02x%02x%02x",
+             motor_addr[0], motor_addr[1], motor_addr[2], motor_addr[3]);
+    ESP_LOGI(TAG, "Pairing: motor addr from response = %s", mid);
+    this->pairing_status_ = std::string("PAIRED: ") + mid;
+    ESP_LOGI(TAG, "Motor paired! ID=%s", mid);
+  }
+
  protected:
   cc1101::CC1101Component *radio_{nullptr};
   uint8_t hub_id_[4]{};
+  bool hub_id_from_yaml_{false};
   uint8_t seq_{0x80};
   uint8_t overheard_seq_{0};
   bool have_overheard_seq_{false};
@@ -121,6 +210,16 @@ class SunfreeHub : public Component {
   uint32_t piggyback_armed_at_{0};
   static constexpr uint32_t PIGGYBACK_TIMEOUT_MS = 300000;  // 5 minutes
 
+  // Scan / pairing state
+  bool scan_active_{false};
+  uint32_t scan_start_ms_{0};
+  uint32_t last_solicit_ms_{0};
+  uint32_t solicit_count_{0};
+  std::vector<uint8_t> solicit_frame_;
+  static constexpr uint32_t SCAN_TIMEOUT_MS = 120000;    // 120 seconds
+  static constexpr uint32_t SOLICIT_INTERVAL_MS = 1500;   // TX every 1.5s (160ms TX + listen gap)
+  std::string pairing_status_{"idle"};
+
   // Raw capture for replay testing
   std::vector<uint8_t> captured_raw_;
   bool have_capture_{false};
@@ -131,6 +230,7 @@ class SunfreeHub : public Component {
   uint32_t rx_status_count_{0};
   uint32_t rx_ack_count_{0};
   uint32_t rx_cmd_count_{0};
+  uint32_t rx_beacon_count_{0};
   std::string last_rx_motor_{"none"};
   std::string last_rx_info_{"waiting"};
   std::string last_cmd_info_{"none"};
@@ -300,6 +400,39 @@ class SunfreeHub : public Component {
 
     // Restore RX configuration
     this->restore_rx_();
+  }
+
+  void init_hub_id_() {
+    if (this->hub_id_from_yaml_) {
+      ESP_LOGI(TAG, "Hub ID from YAML: %s", format_motor_id(this->hub_id_).c_str());
+      return;
+    }
+
+    // Try loading from NVS
+    uint32_t stored_id = 0;
+    auto pref = global_preferences->make_preference<uint32_t>(fnv1_hash("sunfree_hub_id"));
+    if (pref.load(&stored_id) && stored_id != 0) {
+      memcpy(this->hub_id_, &stored_id, 4);
+      ESP_LOGI(TAG, "Hub ID from NVS: %s", format_motor_id(this->hub_id_).c_str());
+      return;
+    }
+
+    // Generate random hub ID
+    stored_id = esp_random();
+    while (stored_id == 0) stored_id = esp_random();
+    memcpy(this->hub_id_, &stored_id, 4);
+    pref.save(&stored_id);
+    global_preferences->sync();
+    ESP_LOGI(TAG, "Hub ID generated: %s (saved to NVS)", format_motor_id(this->hub_id_).c_str());
+  }
+
+  // Build the binary discovery frame (re-built each TX with incrementing seq).
+  void build_solicitation_frame_() {
+    this->solicit_frame_ = build_discovery_packet(this->hub_id_, this->next_seq());
+    int sz = static_cast<int>(this->solicit_frame_.size());
+    char hex[sz * 3 + 1];
+    for (int i = 0; i < sz; i++) snprintf(hex + i * 3, 4, "%02x ", this->solicit_frame_[i]);
+    ESP_LOGI(TAG, "Discovery frame (%d bytes): %s", sz, hex);
   }
 
   void restore_rx_() {
