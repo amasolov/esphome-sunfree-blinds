@@ -327,7 +327,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   uint32_t solicit_count_{0};
   std::vector<uint8_t> solicit_frame_;
   static constexpr uint32_t SCAN_TIMEOUT_MS = 120000;    // 120 seconds
-  static constexpr uint32_t SOLICIT_INTERVAL_MS = 2500;   // TX every 2.5s (320ms TX + listen gap)
+  static constexpr uint32_t SOLICIT_INTERVAL_MS = 1500;   // TX every 1.5s (160ms TX + listen gap)
   std::string pairing_status_{"idle"};
   std::vector<std::string> discovered_ids_;
 
@@ -416,7 +416,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // alignment with the CC1101's internal 40 kbps clock.
   // Static TX buffer avoids heap allocation during the critical-section
   // bit-bang, preventing heap corruption that crashes the SPI driver.
-  static constexpr int TX_BUF_MAX_ = 1900;
+  static constexpr int TX_BUF_MAX_ = 1100;
   uint8_t tx_buf_[TX_BUF_MAX_];
 
   void bitbang_tx_(int total) {
@@ -463,7 +463,10 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->restore_rx_();
 
     int64_t elapsed_us = esp_timer_get_time() - t0;
-    ESP_LOGI(TAG, "Async TX complete (%lldms), restored RX", elapsed_us / 1000);
+    ESP_LOGI(TAG, "Async TX complete (%lldms), RX restored at %.3f MHz%s",
+             elapsed_us / 1000,
+             (this->scan_active_ ? 433933000.0f : 433950000.0f) / 1e6,
+             this->scan_active_ ? " [SCAN]" : "");
   }
 
   void transmit_with_preamble_(std::vector<uint8_t> &pkt) {
@@ -474,7 +477,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     ESP_LOGI(TAG, "TX async preamble+cmd, frame (%d bytes, CRC=0x%02x): %s",
              pkt_sz, pkt_sz > 3 ? pkt[pkt_sz - 1] : 0, hex);
 
-    static constexpr int PREAMBLE_BYTES = 1600;  // 320ms WOR preamble for better range
+    static constexpr int PREAMBLE_BYTES = 800;  // 160ms WOR preamble (matches original Tuya hub)
     int cmd_len = static_cast<int>(pkt.size()) - 2;
     int total = PREAMBLE_BYTES + 4 + cmd_len + 10;
     if (total > TX_BUF_MAX_) {
@@ -503,7 +506,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // sync word.  All motors are awake from the WOR preamble so they all
   // receive their command within milliseconds of each other.
   void transmit_group_with_preamble_(std::vector<std::vector<uint8_t>> &pkts) {
-    static constexpr int PREAMBLE_BYTES = 1600;  // 320ms WOR preamble for better range
+    static constexpr int PREAMBLE_BYTES = 800;  // 160ms WOR preamble (matches original Tuya hub)
     static constexpr int GAP_BYTES = 20;
 
     int payload_total = 0;
@@ -600,6 +603,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     // since the motor responds on the frequency it received on.
     float rx_freq = this->scan_active_ ? 433933000.0f : 433950000.0f;
     this->radio_->set_frequency(rx_freq);
+    this->radio_->set_sync_mode(cc1101::SyncMode::SYNC_MODE_16_16);
     this->radio_->set_sync1(0xD4);
     this->radio_->set_sync0(0x92);
     this->radio_->set_packet_length(CC1101_PKT_LEN);
