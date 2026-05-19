@@ -325,6 +325,14 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
                night.c_str(), day.c_str(), hid.c_str());
       this->last_rx_info_ = buf;
 
+      // Add both motor IDs to discovered list
+      auto add_discovered = [this](const std::string &id) {
+        for (auto &d : this->discovered_ids_) { if (d == id) return; }
+        this->discovered_ids_.push_back(id);
+      };
+      add_discovered(night);
+      add_discovered(day);
+
       if (this->scan_active_) {
         this->scan_active_ = false;
         char pbuf[120];
