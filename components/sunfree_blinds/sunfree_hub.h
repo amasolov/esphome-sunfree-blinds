@@ -414,36 +414,15 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // Fix: use async serial mode to bit-bang the ENTIRE stream via GDO0
   // with absolute timestamp-based timing to maintain exact symbol rate
   // alignment with the CC1101's internal 40 kbps clock.
-  void transmit_with_preamble_(std::vector<uint8_t> &pkt) {
-    int pkt_sz = static_cast<int>(pkt.size());
-    char hex[29 * 3 + 1];
-    for (int i = 0; i < pkt_sz && i < 29; i++)
-      snprintf(hex + i * 3, 4, "%02x ", pkt[i]);
-    ESP_LOGI(TAG, "TX async preamble+cmd, frame (%d bytes, CRC=0x%02x): %s",
-             pkt_sz, pkt_sz > 3 ? pkt[pkt_sz - 1] : 0, hex);
+  // Static TX buffer avoids heap allocation during the critical-section
+  // bit-bang, preventing heap corruption that crashes the SPI driver.
+  static constexpr int TX_BUF_MAX_ = 1100;
+  uint8_t tx_buf_[TX_BUF_MAX_];
 
-    // Build the entire TX stream: preamble + sync + LEN + payload + CRC + tail
-    static constexpr int PREAMBLE_BYTES = 800;
-    // pkt = [4A 44 LEN payload CRC]; skip first 2 bytes (4A 44 are part of sync)
-    int cmd_len = static_cast<int>(pkt.size()) - 2;
-    int total = PREAMBLE_BYTES + 4 + cmd_len + 10;  // +10 tail
-    std::vector<uint8_t> stream(total);
-
-    int p = 0;
-    for (int i = 0; i < PREAMBLE_BYTES; i++) stream[p++] = 0xAA;
-    stream[p++] = 0x53; stream[p++] = 0x52;
-    stream[p++] = 0x4A; stream[p++] = 0x44;
-    for (int i = 2; i < static_cast<int>(pkt.size()); i++) stream[p++] = pkt[i];
-    while (p < total) stream[p++] = 0xAA;
-
-    // Configure for TX — match hub frequency (433.920 MHz actual).
-    // CC1101 crystal runs 13 kHz low, so configure 433.933 MHz.
+  void bitbang_tx_(int total) {
     this->radio_->set_crc_enable(false);
     this->radio_->set_whitening(false);
     this->radio_->set_frequency(433933000.0f);
-    // CRITICAL: set_packet_mode(false) writes IOCFG0=0x0D so the CC1101
-    // routes GDO0 for serial data instead of driving FIFO-status LOW,
-    // which would create bus contention with our ESP32 GPIO output.
     this->radio_->set_packet_mode(false);
     this->radio_->begin_tx();
 
@@ -452,9 +431,6 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     ESP_LOGI(TAG, "WOR: %d bytes stream (%dms), async serial",
              total, total * 8 / 40);
 
-    // Bit-bang using absolute timestamps for drift-free timing.
-    // At 40 kbps, one bit = 25µs.  We use esp_timer_get_time() (µs resolution)
-    // and busy-wait to each exact bit edge.
     int64_t t0 = esp_timer_get_time();
     int bit_idx = 0;
 
@@ -462,14 +438,13 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     portENTER_CRITICAL(&mux);
 
     for (int b = 0; b < total; b++) {
-      uint8_t byte = stream[b];
+      uint8_t byte = this->tx_buf_[b];
       for (int bit = 7; bit >= 0; bit--) {
         int64_t target = t0 + static_cast<int64_t>(bit_idx) * 25;
         while (esp_timer_get_time() < target) {}
         gpio_set_level(GPIO_NUM_4, (byte >> bit) & 1);
         bit_idx++;
       }
-      // Yield every 256 bytes to feed watchdog (still in critical section)
       if ((b & 0xFF) == 0xFF) {
         portEXIT_CRITICAL(&mux);
         portENTER_CRITICAL(&mux);
@@ -478,13 +453,43 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
     portEXIT_CRITICAL(&mux);
 
-    // Restore packet mode RX
+    // Restore GDO0 as input before touching SPI again
+    gpio_set_direction(GPIO_NUM_4, GPIO_MODE_INPUT);
+    // Brief yield to let pending ISRs drain before SPI operations
+    vTaskDelay(1);
+
     this->radio_->begin_rx();
     this->radio_->set_packet_mode(true);
     this->restore_rx_();
 
     int64_t elapsed_us = esp_timer_get_time() - t0;
     ESP_LOGI(TAG, "Async TX complete (%lldms), restored RX", elapsed_us / 1000);
+  }
+
+  void transmit_with_preamble_(std::vector<uint8_t> &pkt) {
+    int pkt_sz = static_cast<int>(pkt.size());
+    char hex[29 * 3 + 1];
+    for (int i = 0; i < pkt_sz && i < 29; i++)
+      snprintf(hex + i * 3, 4, "%02x ", pkt[i]);
+    ESP_LOGI(TAG, "TX async preamble+cmd, frame (%d bytes, CRC=0x%02x): %s",
+             pkt_sz, pkt_sz > 3 ? pkt[pkt_sz - 1] : 0, hex);
+
+    static constexpr int PREAMBLE_BYTES = 800;
+    int cmd_len = static_cast<int>(pkt.size()) - 2;
+    int total = PREAMBLE_BYTES + 4 + cmd_len + 10;
+    if (total > TX_BUF_MAX_) {
+      ESP_LOGE(TAG, "TX stream too large: %d > %d", total, TX_BUF_MAX_);
+      return;
+    }
+
+    int p = 0;
+    memset(this->tx_buf_, 0xAA, total);
+    p = PREAMBLE_BYTES;
+    this->tx_buf_[p++] = 0x53; this->tx_buf_[p++] = 0x52;
+    this->tx_buf_[p++] = 0x4A; this->tx_buf_[p++] = 0x44;
+    for (int i = 2; i < static_cast<int>(pkt.size()); i++) this->tx_buf_[p++] = pkt[i];
+
+    this->bitbang_tx_(total);
 
     // Phase 3: retransmissions using packet mode (motor should be awake now).
     // Skip during pairing scan -- the motor responds immediately and we
@@ -499,61 +504,31 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // receive their command within milliseconds of each other.
   void transmit_group_with_preamble_(std::vector<std::vector<uint8_t>> &pkts) {
     static constexpr int PREAMBLE_BYTES = 800;
-    static constexpr int GAP_BYTES = 20;  // ~4ms re-sync gap between commands
+    static constexpr int GAP_BYTES = 20;
 
     int payload_total = 0;
     for (auto &pkt : pkts) {
       payload_total += 4 + (static_cast<int>(pkt.size()) - 2) + GAP_BYTES;
     }
     int total = PREAMBLE_BYTES + payload_total + 10;
-    std::vector<uint8_t> stream(total);
-
-    int p = 0;
-    for (int i = 0; i < PREAMBLE_BYTES; i++) stream[p++] = 0xAA;
-    for (auto &pkt : pkts) {
-      stream[p++] = 0x53; stream[p++] = 0x52;
-      stream[p++] = 0x4A; stream[p++] = 0x44;
-      for (int i = 2; i < static_cast<int>(pkt.size()); i++) stream[p++] = pkt[i];
-      for (int i = 0; i < GAP_BYTES; i++) stream[p++] = 0xAA;
+    if (total > TX_BUF_MAX_) {
+      ESP_LOGE(TAG, "GROUP TX stream too large: %d > %d", total, TX_BUF_MAX_);
+      return;
     }
-    while (p < total) stream[p++] = 0xAA;
 
-    this->radio_->set_crc_enable(false);
-    this->radio_->set_whitening(false);
-    this->radio_->set_frequency(433933000.0f);
-    this->radio_->set_packet_mode(false);
-    this->radio_->begin_tx();
-    gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
+    memset(this->tx_buf_, 0xAA, total);
+    int p = PREAMBLE_BYTES;
+    for (auto &pkt : pkts) {
+      this->tx_buf_[p++] = 0x53; this->tx_buf_[p++] = 0x52;
+      this->tx_buf_[p++] = 0x4A; this->tx_buf_[p++] = 0x44;
+      for (int i = 2; i < static_cast<int>(pkt.size()); i++) this->tx_buf_[p++] = pkt[i];
+      p += GAP_BYTES;  // already 0xAA from memset
+    }
 
     ESP_LOGI(TAG, "GROUP WOR: %d bytes stream (%dms), %d motors",
              total, total * 8 / 40, static_cast<int>(pkts.size()));
 
-    int64_t t0 = esp_timer_get_time();
-    int bit_idx = 0;
-    portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
-    portENTER_CRITICAL(&mux);
-    for (int b = 0; b < total; b++) {
-      uint8_t byte = stream[b];
-      for (int bit = 7; bit >= 0; bit--) {
-        int64_t target = t0 + static_cast<int64_t>(bit_idx) * 25;
-        while (esp_timer_get_time() < target) {}
-        gpio_set_level(GPIO_NUM_4, (byte >> bit) & 1);
-        bit_idx++;
-      }
-      if ((b & 0xFF) == 0xFF) {
-        portEXIT_CRITICAL(&mux);
-        portENTER_CRITICAL(&mux);
-      }
-    }
-    portEXIT_CRITICAL(&mux);
-
-    this->radio_->begin_rx();
-    this->radio_->set_packet_mode(true);
-    this->restore_rx_();
-
-    int64_t elapsed_us = esp_timer_get_time() - t0;
-    ESP_LOGI(TAG, "GROUP TX complete (%lldms), %d cmds sent", elapsed_us / 1000,
-             static_cast<int>(pkts.size()));
+    this->bitbang_tx_(total);
 
     // Retransmit each command once more in packet mode (motors are awake)
     for (auto &pkt : pkts) {
