@@ -422,7 +422,9 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   void bitbang_tx_(int total) {
     this->radio_->set_crc_enable(false);
     this->radio_->set_whitening(false);
-    this->radio_->set_frequency(433933000.0f);
+    // Use 433.950 MHz for all TX — matches the Tuya hub's actual on-air frequency
+    // (RTL-SDR confirmed the hub sends at 433.950, not 433.933)
+    this->radio_->set_frequency(433950000.0f);
     this->radio_->set_packet_mode(false);
     this->radio_->begin_tx();
 
@@ -463,9 +465,8 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->restore_rx_();
 
     int64_t elapsed_us = esp_timer_get_time() - t0;
-    ESP_LOGI(TAG, "Async TX complete (%lldms), RX restored at %.3f MHz%s",
+    ESP_LOGI(TAG, "Async TX complete (%lldms), RX restored at 433.950 MHz%s",
              elapsed_us / 1000,
-             (this->scan_active_ ? 433933000.0f : 433950000.0f) / 1e6,
              this->scan_active_ ? " [SCAN]" : "");
   }
 
@@ -548,7 +549,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->radio_->set_sync1(0x53);
     this->radio_->set_sync0(0x52);
     this->radio_->set_sync_mode(cc1101::SyncMode::SYNC_MODE_16_16);
-    this->radio_->set_frequency(433933000.0f);
+    this->radio_->set_frequency(433950000.0f);
     this->radio_->set_packet_length(static_cast<uint8_t>(pkt.size()));
 
     for (int r = 0; r < retries; r++) {
@@ -599,10 +600,10 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->radio_->set_idle();
     this->radio_->set_crc_enable(false);
     this->radio_->set_whitening(false);
-    // During pairing scan, listen on the TX frequency (433.920 MHz actual)
-    // since the motor responds on the frequency it received on.
-    float rx_freq = this->scan_active_ ? 433933000.0f : 433950000.0f;
-    this->radio_->set_frequency(rx_freq);
+    // Always use 433.950 MHz for RX — RTL-SDR confirmed motor responds
+    // at ~433.935 MHz regardless of solicitation frequency (within the
+    // 203 kHz RX filter bandwidth centered on 433.950)
+    this->radio_->set_frequency(433950000.0f);
     this->radio_->set_sync_mode(cc1101::SyncMode::SYNC_MODE_16_16);
     this->radio_->set_sync1(0xD4);
     this->radio_->set_sync0(0x92);
