@@ -127,13 +127,8 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
 
   // During scan, log ALL strong packets at INFO level to detect motor responses
   // even if the first byte isn't 0x91 (could indicate frequency/sync issues)
-  if (this->scan_active_ && rssi > -90.0f) {
-    ESP_LOGW(TAG, "SCAN STRONG RX #%u (%d bytes, rssi=%.0f): %s",
-             this->rx_packet_count_, data.size(), rssi, hex);
-  } else {
-    ESP_LOGD(TAG, "RX #%u raw (%d bytes, rssi=%.0f): %s",
-             this->rx_packet_count_, data.size(), rssi, hex);
-  }
+  ESP_LOGI(TAG, "RX #%u raw (%d bytes, rssi=%.0f): %s",
+           this->rx_packet_count_, data.size(), rssi, hex);
 
   if (data.size() < 2 || data[0] != 0x91) return;
 
