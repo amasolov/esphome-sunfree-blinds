@@ -455,9 +455,9 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
     // Restore GDO0 as input before touching SPI again
     gpio_set_direction(GPIO_NUM_4, GPIO_MODE_INPUT);
-    // Brief yield to let pending ISRs drain before SPI operations
-    vTaskDelay(1);
 
+    // Get back into RX as fast as possible -- the motor's pairing response
+    // is a short burst that can arrive within milliseconds of our TX ending.
     this->radio_->begin_rx();
     this->radio_->set_packet_mode(true);
     this->restore_rx_();
