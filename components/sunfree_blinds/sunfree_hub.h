@@ -53,15 +53,47 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
                      {"motor_id", "action_type"});
     register_service(&SunfreeHub::on_group_command_, "group_command",
                      {"group", "action"});
-    ESP_LOGI(TAG, "Registered services: send_config, group_command");
+    register_service(&SunfreeHub::on_request_status_, "request_status",
+                     {"motor_id"});
+    ESP_LOGI(TAG, "Registered services: send_config, group_command, request_status");
 
     if (this->web_base_) this->setup_web_();
   }
 
   void loop() override {
-    if (!this->scan_active_) return;
-
     uint32_t now = millis();
+
+    // Follow-up retransmissions with RX gaps — mimics the Tuya hub's
+    // TX/RX cycling.  The hub sends ~4 follow-ups 200ms apart; after
+    // several rounds the motor sends a STATUS report (type 0x06) with
+    // battery + position instead of just an ACK.
+    if (this->followup_remaining_ > 0 && now >= this->followup_next_ms_) {
+      int idx = this->followup_total_ - this->followup_remaining_;
+      ESP_LOGI(TAG, "Follow-up TX %d/%d", idx + 1, this->followup_total_);
+      this->transmit_command_only_(this->followup_pkt_, 1);
+      this->followup_remaining_--;
+      if (this->followup_remaining_ > 0) {
+        this->followup_next_ms_ = now + FOLLOWUP_GAP_MS;
+      }
+    }
+
+    // Group follow-ups: retransmit all group commands per round
+    if (this->followup_group_remaining_ > 0 && this->followup_remaining_ <= 0 &&
+        now >= this->followup_next_ms_) {
+      ESP_LOGI(TAG, "Group follow-up %d/%d (%d motors)",
+               FOLLOWUP_COUNT - this->followup_group_remaining_ + 1,
+               FOLLOWUP_COUNT,
+               static_cast<int>(this->followup_group_pkts_.size()));
+      for (auto &pkt : this->followup_group_pkts_) {
+        this->transmit_command_only_(pkt, 1);
+      }
+      this->followup_group_remaining_--;
+      if (this->followup_group_remaining_ > 0) {
+        this->followup_next_ms_ = now + FOLLOWUP_GAP_MS;
+      }
+    }
+
+    if (!this->scan_active_) return;
 
     // Check scan timeout
     if (now - this->scan_start_ms_ > SCAN_TIMEOUT_MS) {
@@ -129,6 +161,21 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->transmit_with_preamble_(pkt);
   }
 
+  // Poll a motor for status (battery + position) using action 0x2A.
+  // The Tuya hub sends this after pairing; the motor responds with STATUS.
+  void request_status(const uint8_t *motor_id) {
+    uint8_t seq = this->next_seq();
+    std::vector<uint8_t> pkt = build_n4_command(
+        this->hub_id_, motor_id, seq,
+        static_cast<uint8_t>(SunfreeCmd::STATUS_QUERY), 0x00,
+        this->swap_fields_);
+    ESP_LOGI(TAG, "TX STATUS_QUERY seq=0x%02x motor=%s", seq,
+             format_motor_id(motor_id).c_str());
+    this->transmit_with_preamble_(pkt);
+  }
+
+  float get_last_rssi() const { return this->last_rssi_; }
+
  protected:
   void on_send_config_(std::string motor_id, std::string action_type) {
     uint8_t mid[4];
@@ -157,6 +204,9 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     } else if (action_type == "goto_favourite") {
       action = static_cast<uint8_t>(SunfreeCmd::GOTO_FAVOURITE);
       value = GOTO_FAV_VALUE;
+    } else if (action_type == "request_status") {
+      this->request_status(mid);
+      return;
     } else {
       ESP_LOGW(TAG, "send_config: unknown action_type '%s'", action_type.c_str());
       return;
@@ -165,6 +215,23 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     ESP_LOGI(TAG, "Service send_config: motor=%s action=%s (0x%02X/0x%02X)",
              motor_id.c_str(), action_type.c_str(), action, value);
     this->send_config(mid, action, value);
+  }
+
+  void on_request_status_(std::string motor_id) {
+    if (motor_id == "all") {
+      for (auto &kv : this->covers_) {
+        this->request_status(kv.second->get_motor_id());
+      }
+      return;
+    }
+    uint8_t mid[4];
+    if (motor_id.length() != 8) {
+      ESP_LOGW(TAG, "request_status: motor_id must be 8 hex chars or 'all', got '%s'",
+               motor_id.c_str());
+      return;
+    }
+    parse_motor_id(motor_id, mid);
+    this->request_status(mid);
   }
 
   void on_group_command_(std::string group, std::string action_str) {
@@ -331,6 +398,18 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   std::string pairing_status_{"idle"};
   std::vector<std::string> discovered_ids_;
 
+  // Follow-up retransmission state (TX/RX cycling like Tuya hub).
+  // After the initial WOR preamble+command, schedule several follow-ups
+  // ~200ms apart so the motor has RX gaps to send STATUS reports.
+  std::vector<uint8_t> followup_pkt_;
+  std::vector<std::vector<uint8_t>> followup_group_pkts_;
+  uint32_t followup_next_ms_{0};
+  int followup_remaining_{0};
+  int followup_total_{0};
+  int followup_group_remaining_{0};
+  static constexpr uint32_t FOLLOWUP_GAP_MS = 200;
+  static constexpr int FOLLOWUP_COUNT = 4;
+
   // Raw capture for replay testing
   std::vector<uint8_t> captured_raw_;
   bool have_capture_{false};
@@ -342,6 +421,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   uint32_t rx_ack_count_{0};
   uint32_t rx_cmd_count_{0};
   uint32_t rx_beacon_count_{0};
+  float last_rssi_{0.0f};
   std::string last_rx_motor_{"none"};
   std::string last_rx_info_{"waiting"};
   std::string last_cmd_info_{"none"};
@@ -403,6 +483,16 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   bool piggyback_expired_() const {
     return this->piggyback_armed_ &&
            (millis() - this->piggyback_armed_at_ > PIGGYBACK_TIMEOUT_MS);
+  }
+
+  // Send ACK back to motor after receiving its STATUS report.
+  // The Tuya hub does this; the motor may require it to send further reports.
+  void send_ack_to_motor_(const uint8_t *motor_id, uint8_t seq) {
+    std::vector<uint8_t> pkt = build_ack_packet(
+        this->hub_id_, motor_id, seq, 0x00, this->swap_fields_);
+    ESP_LOGI(TAG, "TX ACK→motor seq=0x%02x motor=%s",
+             seq, format_motor_id(motor_id).c_str());
+    this->transmit_command_only_(pkt, 1);
   }
 
   // Gap-free long preamble + command using CC1101 async serial mode.
@@ -496,11 +586,19 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
     this->bitbang_tx_(total);
 
-    // Phase 3: retransmissions using packet mode (motor should be awake now).
-    // Skip during pairing scan -- the motor responds immediately and we
-    // need a clean RX window to catch the short response burst.
+    // Schedule follow-up retransmissions via loop() instead of blasting
+    // them back-to-back.  The Tuya hub sends 6-8 TX/RX cycles ~200ms
+    // apart; the motor only sends STATUS (battery+position) after
+    // several rounds of command/ACK exchanges.
+    // Skip during pairing scan — need a clean RX window for the
+    // motor's short response burst.
     if (!this->scan_active_) {
-      this->transmit_command_only_(pkt, 4);
+      this->followup_pkt_ = pkt;
+      this->followup_remaining_ = FOLLOWUP_COUNT;
+      this->followup_total_ = FOLLOWUP_COUNT;
+      this->followup_next_ms_ = millis() + FOLLOWUP_GAP_MS;
+      ESP_LOGI(TAG, "Scheduled %d follow-ups, first in %dms",
+               FOLLOWUP_COUNT, FOLLOWUP_GAP_MS);
     }
   }
 
@@ -535,9 +633,15 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
     this->bitbang_tx_(total);
 
-    // Retransmit each command twice in packet mode (motors are awake)
-    for (auto &pkt : pkts) {
-      this->transmit_command_only_(pkt, 2);
+    // Schedule follow-ups for all motors in the group.  The first
+    // follow-up fires after FOLLOWUP_GAP_MS; it retransmits all
+    // group commands so each motor gets TX/RX cycling for STATUS.
+    if (!pkts.empty()) {
+      this->followup_group_pkts_ = pkts;
+      this->followup_group_remaining_ = FOLLOWUP_COUNT;
+      this->followup_next_ms_ = millis() + FOLLOWUP_GAP_MS;
+      ESP_LOGI(TAG, "GROUP: scheduled %d follow-ups for %d motors",
+               FOLLOWUP_COUNT, static_cast<int>(pkts.size()));
     }
   }
 

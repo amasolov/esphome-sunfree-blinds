@@ -17,6 +17,7 @@ class SunfreeCover : public cover::Cover, public Component {
     this->motor_id_str_ = id;
   }
   void set_battery_sensor(sensor::Sensor *sensor) { this->battery_sensor_ = sensor; }
+  void set_signal_sensor(sensor::Sensor *sensor) { this->signal_sensor_ = sensor; }
 
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI - 1; }
 
@@ -71,7 +72,7 @@ class SunfreeCover : public cover::Cover, public Component {
     }
   }
 
-  void on_status(uint8_t state, uint8_t motor_position, uint8_t battery) {
+  void on_status(uint8_t state, uint8_t motor_position, uint8_t battery, float rssi = 0.0f) {
     float ha_pos = (100.0f - motor_position) / 100.0f;
     this->position = ha_pos;
 
@@ -91,10 +92,13 @@ class SunfreeCover : public cover::Cover, public Component {
     if (this->battery_sensor_ != nullptr) {
       this->battery_sensor_->publish_state(battery);
     }
+    if (this->signal_sensor_ != nullptr) {
+      this->signal_sensor_->publish_state(rssi);
+    }
 
-    ESP_LOGD("sunfree", "Status %s: state=%d pos=%d(%d%%) bat=%d%%",
+    ESP_LOGI("sunfree", "Status %s: state=%d pos=%d(%d%%) bat=%d%% rssi=%.0f",
              this->motor_id_str_.c_str(), state, motor_position,
-             static_cast<int>(ha_pos * 100), battery);
+             static_cast<int>(ha_pos * 100), battery, rssi);
   }
 
  protected:
@@ -102,6 +106,7 @@ class SunfreeCover : public cover::Cover, public Component {
   uint8_t motor_id_[4]{};
   std::string motor_id_str_;
   sensor::Sensor *battery_sensor_{nullptr};
+  sensor::Sensor *signal_sensor_{nullptr};
 };
 
 // Implementation of hub method that depends on SunfreeCover
@@ -111,6 +116,7 @@ inline void SunfreeHub::register_cover(SunfreeCover *cover) {
 
 inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float rssi) {
   this->rx_packet_count_++;
+  this->last_rssi_ = rssi;
 
   // Expire stale piggyback
   if (this->piggyback_expired_()) {
@@ -283,10 +289,14 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
 
       auto it = this->covers_.find(mid);
       if (it != this->covers_.end()) {
-        it->second->on_status(resp.state, resp.position, resp.battery);
+        it->second->on_status(resp.state, resp.position, resp.battery, rssi);
       } else {
         ESP_LOGW(TAG, "Status from unknown motor %s", mid.c_str());
       }
+
+      // ACK back to the motor — the Tuya hub always does this after STATUS;
+      // the motor may require it before sending further reports.
+      this->send_ack_to_motor_(resp.motor_id, resp.seq);
 
       // Auto-piggyback: fire queued command when target motor sends status report.
       // Verify hub_id to ensure this is a genuine motor→hub report.

@@ -47,6 +47,8 @@ LEN  SEQ  CMD  ADDRESS  FLG  00   DP   ACT  VAL
 | 0x21 | SET_LIMIT | 0x03 | n=4 (16 enc) | Save current position as **favourite** |
 | 0x22 | SET_DIRECTION | 0x00 | n=4 (16 enc) | Motor direction = **forward** |
 | 0x22 | SET_DIRECTION | 0x01 | n=4 (16 enc) | Motor direction = **reverse** |
+| 0x2A | STATUS_QUERY | 0x00 | n=4 (16 enc) | Poll motor for STATUS (battery+position) |
+| 0x2C | CONFIG_QUERY | 0x00 | n=4 (16 enc) | Post-pairing config query (observed, untested) |
 | 0x2D | DISCOVERY | n/a | n=3 (12 enc + 3 clear) | Pairing discovery (broadcast) |
 
 ## Encryption scope
@@ -282,10 +284,25 @@ Maximum 30 motor IDs per hub (firmware limit `0x1E` = 15 physical units).
 
 After the initial discovery+response, the Tuya hub sends additional
 commands with actions 0x2A, 0x2C addressed to each motor ID. These
-appear to be configuration/parameter-setting commands. The motor
-responds with ACKs and STATUS reports. These are not required for
-basic operation — the motor accepts OPEN/CLOSE/STOP immediately
-after pairing.
+trigger the motor to respond with ACKs and STATUS reports. Action 0x2A
+is used as a **status poll** — sending it at any time elicits a STATUS
+response containing battery + position. The ESP32 exposes this as the
+`request_status` HA service.
+
+#### Hub → Motor ACK
+
+After receiving a motor STATUS report (type 0x06), the hub sends an
+ACK (type 0x03, n=3 XXTEA, 12 bytes) back to the motor. This mirrors
+the motor's ACK format:
+
+```
+B0   B1   B2   B3..B6   B7..BA   BB
+08   SEQ  01   HUB_ID   MOTOR_ID FLAGS
+            encrypted 12 bytes
+```
+
+The motor may require this ACK to send further STATUS reports.
+Without it, the pairing handshake shows the motor stops after one report.
 
 ## RF layer
 
@@ -512,6 +529,29 @@ the command is also queued. When the motor eventually sends a periodic
 status report (~10-30s), the ESP32 immediately fires the command during
 the motor's guaranteed post-TX RX window.
 
+### TX/RX cycling (status elicitation)
+
+The motor only sends STATUS reports (type 0x06, 24-byte) after multiple
+rounds of command→ACK exchanges.  The Tuya hub does **6-8 TX/RX cycles**
+per command session, alternating between sending and listening:
+
+```
+T+0ms     HUB  → command (full WOR preamble)
+T+~60ms   MOTOR → ACK
+T+~400ms  HUB  → command (short preamble, motor awake)
+T+~460ms  MOTOR → ACK
+T+~800ms  HUB  → command
+T+~860ms  MOTOR → ACK
+T+~1100ms MOTOR → STATUS (battery + position!)
+T+~1200ms HUB  → ACK
+T+~1400ms MOTOR → STATUS (second report)
+```
+
+**Without** the follow-up retransmissions (TX/RX cycling), the motor
+only sends ACKs — it never sends STATUS.  The ESP32 implementation
+schedules 4 follow-up retransmissions ~200ms apart via the main loop,
+giving the CC1101 time to receive motor responses between each TX.
+
 ## Implementation notes
 
 To send a command from ESP32+CC1101:
@@ -519,8 +559,9 @@ To send a command from ESP32+CC1101:
 2. Determine n_words based on command type (3 for stop, 4 for set_position)
 3. Encrypt first `n_words * 4` bytes using XXTEA with the key
 4. Append any unencrypted tail bytes
-5. Send ~200ms WOR preamble (12 × 61-byte 0xAA packets with sync=0xAAAA)
-6. Transmit command via CC1101 with sync=0x5352, 3 retries
+5. Send ~200ms WOR preamble (bit-banged via async serial on GDO0)
+6. Schedule 4 follow-up retransmissions ~200ms apart (non-blocking, via loop)
+7. The motor responds with ACK after each retransmission, then STATUS
 
 To receive a motor response:
 1. Listen on 433.95 MHz for GFSK packets (CC1101 sync 0xD492)
