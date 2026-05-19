@@ -64,17 +64,33 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     uint32_t now = millis();
 
     // Follow-up retransmissions with RX gaps — mimics the Tuya hub's
-    // TX/RX cycling.  The hub sends ~4 follow-ups 200ms apart; after
-    // several rounds the motor sends a STATUS report (type 0x06) with
-    // battery + position instead of just an ACK.
+    // TX/RX cycling.  Each follow-up is rebuilt with a FRESH seq so the
+    // motor doesn't deduplicate.  The hub sends 6-8 TX/RX cycles ~200ms
+    // apart; the motor sends STATUS after several rounds.
     if (this->followup_remaining_ > 0 && now >= this->followup_next_ms_) {
       int idx = this->followup_total_ - this->followup_remaining_;
-      ESP_LOGI(TAG, "Follow-up TX %d/%d", idx + 1, this->followup_total_);
-      this->transmit_command_only_(this->followup_pkt_, 1);
+      uint8_t seq = this->next_seq();
+      auto pkt = this->build_followup_pkt_(seq);
+      ESP_LOGI(TAG, "Follow-up TX %d/%d seq=0x%02x", idx + 1, this->followup_total_, seq);
+      this->transmit_command_only_(pkt, 1);
       this->followup_remaining_--;
       if (this->followup_remaining_ > 0) {
         this->followup_next_ms_ = now + FOLLOWUP_GAP_MS;
       }
+    }
+
+    // Queued status poll: process one motor at a time with full TX/RX
+    // cycling before moving to the next.  Fires after current follow-ups
+    // complete (or immediately if none active).
+    if (!this->poll_queue_.empty() && this->followup_remaining_ <= 0 &&
+        this->followup_group_remaining_ <= 0) {
+      auto mid_str = this->poll_queue_.front();
+      this->poll_queue_.erase(this->poll_queue_.begin());
+      uint8_t mid[4];
+      parse_motor_id(mid_str, mid);
+      ESP_LOGI(TAG, "Poll queue: sending STATUS_QUERY to %s (%d remaining)",
+               mid_str.c_str(), static_cast<int>(this->poll_queue_.size()));
+      this->request_status(mid);
     }
 
     // Group follow-ups: retransmit all group commands per round
@@ -130,6 +146,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     ESP_LOGI(TAG, "TX %s seq=0x%02x motor=%s", act_name, seq,
              format_motor_id(motor_id).c_str());
     this->transmit_with_preamble_(pkt);
+    this->schedule_followups_(motor_id, action, position, true);
 
     // Also arm auto-piggyback as fallback for deep-sleeping motors
     this->arm_piggyback_(motor_id, action, position);
@@ -159,19 +176,20 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     ESP_LOGI(TAG, "TX CONFIG action=0x%02x value=0x%02x seq=0x%02x motor=%s",
              action, value, seq, format_motor_id(motor_id).c_str());
     this->transmit_with_preamble_(pkt);
+    this->schedule_followups_(motor_id, action, value);
   }
 
   // Poll a motor for status (battery + position) using action 0x2A.
   // The Tuya hub sends this after pairing; the motor responds with STATUS.
   void request_status(const uint8_t *motor_id) {
     uint8_t seq = this->next_seq();
+    uint8_t action = static_cast<uint8_t>(SunfreeCmd::STATUS_QUERY);
     std::vector<uint8_t> pkt = build_n4_command(
-        this->hub_id_, motor_id, seq,
-        static_cast<uint8_t>(SunfreeCmd::STATUS_QUERY), 0x00,
-        this->swap_fields_);
+        this->hub_id_, motor_id, seq, action, 0x00, this->swap_fields_);
     ESP_LOGI(TAG, "TX STATUS_QUERY seq=0x%02x motor=%s", seq,
              format_motor_id(motor_id).c_str());
     this->transmit_with_preamble_(pkt);
+    this->schedule_followups_(motor_id, action, 0x00);
   }
 
   float get_last_rssi() const { return this->last_rssi_; }
@@ -219,11 +237,12 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
   void on_request_status_(std::string motor_id) {
     if (motor_id == "all") {
+      this->poll_queue_.clear();
       for (auto &kv : this->covers_) {
-        uint8_t mid[4];
-        parse_motor_id(kv.first, mid);
-        this->request_status(mid);
+        this->poll_queue_.push_back(kv.first);
       }
+      ESP_LOGI(TAG, "Queued STATUS_QUERY for %d motors",
+               static_cast<int>(this->poll_queue_.size()));
       return;
     }
     uint8_t mid[4];
@@ -401,16 +420,24 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   std::vector<std::string> discovered_ids_;
 
   // Follow-up retransmission state (TX/RX cycling like Tuya hub).
-  // After the initial WOR preamble+command, schedule several follow-ups
-  // ~200ms apart so the motor has RX gaps to send STATUS reports.
-  std::vector<uint8_t> followup_pkt_;
+  // Each follow-up is rebuilt with a fresh seq so the motor doesn't
+  // deduplicate.  We store the context (motor_id, action, value) to
+  // rebuild packets on each retransmission.
+  uint8_t followup_motor_id_[4]{};
+  uint8_t followup_action_{0};
+  uint8_t followup_value_{0};
+  bool followup_is_command_{false};
   std::vector<std::vector<uint8_t>> followup_group_pkts_;
   uint32_t followup_next_ms_{0};
   int followup_remaining_{0};
   int followup_total_{0};
   int followup_group_remaining_{0};
   static constexpr uint32_t FOLLOWUP_GAP_MS = 200;
-  static constexpr int FOLLOWUP_COUNT = 4;
+  static constexpr int FOLLOWUP_COUNT = 6;
+
+  // Queued status poll — process one motor at a time with full TX/RX
+  // cycling between each, so motors get proper follow-ups.
+  std::vector<std::string> poll_queue_;
 
   // Raw capture for replay testing
   std::vector<uint8_t> captured_raw_;
@@ -485,6 +512,18 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   bool piggyback_expired_() const {
     return this->piggyback_armed_ &&
            (millis() - this->piggyback_armed_at_ > PIGGYBACK_TIMEOUT_MS);
+  }
+
+  // Rebuild follow-up packet with a fresh seq to avoid motor deduplication.
+  std::vector<uint8_t> build_followup_pkt_(uint8_t seq) {
+    if (this->followup_is_command_) {
+      return this->build_command_packet_(this->followup_motor_id_,
+                                          this->followup_action_,
+                                          this->followup_value_, seq);
+    }
+    return build_n4_command(this->hub_id_, this->followup_motor_id_, seq,
+                            this->followup_action_, this->followup_value_,
+                            this->swap_fields_);
   }
 
   // Send ACK back to motor after receiving its STATUS report.
@@ -587,21 +626,24 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     for (int i = 2; i < static_cast<int>(pkt.size()); i++) this->tx_buf_[p++] = pkt[i];
 
     this->bitbang_tx_(total);
+  }
 
-    // Schedule follow-up retransmissions via loop() instead of blasting
-    // them back-to-back.  The Tuya hub sends 6-8 TX/RX cycles ~200ms
-    // apart; the motor only sends STATUS (battery+position) after
-    // several rounds of command/ACK exchanges.
-    // Skip during pairing scan — need a clean RX window for the
-    // motor's short response burst.
-    if (!this->scan_active_) {
-      this->followup_pkt_ = pkt;
-      this->followup_remaining_ = FOLLOWUP_COUNT;
-      this->followup_total_ = FOLLOWUP_COUNT;
-      this->followup_next_ms_ = millis() + FOLLOWUP_GAP_MS;
-      ESP_LOGI(TAG, "Scheduled %d follow-ups, first in %dms",
-               FOLLOWUP_COUNT, FOLLOWUP_GAP_MS);
-    }
+  // Schedule follow-up retransmissions via loop().  Each follow-up is
+  // rebuilt with a fresh seq so the motor doesn't deduplicate by seq.
+  // is_command=true for movement commands (OPEN/CLOSE/STOP/POS),
+  // false for config/query commands (0x2A, 0x22, etc.)
+  void schedule_followups_(const uint8_t *motor_id, uint8_t action,
+                            uint8_t value, bool is_command = false) {
+    if (this->scan_active_) return;
+    memcpy(this->followup_motor_id_, motor_id, 4);
+    this->followup_action_ = action;
+    this->followup_value_ = value;
+    this->followup_is_command_ = is_command;
+    this->followup_remaining_ = FOLLOWUP_COUNT;
+    this->followup_total_ = FOLLOWUP_COUNT;
+    this->followup_next_ms_ = millis() + FOLLOWUP_GAP_MS;
+    ESP_LOGI(TAG, "Scheduled %d follow-ups, first in %dms",
+             FOLLOWUP_COUNT, FOLLOWUP_GAP_MS);
   }
 
   // Single preamble followed by multiple command packets, each with its own
