@@ -80,17 +80,19 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     }
 
     // Queued status poll: process one motor at a time with full TX/RX
-    // cycling before moving to the next.  Fires after current follow-ups
-    // complete (or immediately if none active).
+    // cycling + cooldown before moving to the next.  The cooldown gives
+    // late STATUS responses time to arrive before the next WOR blocks RX.
     if (!this->poll_queue_.empty() && this->followup_remaining_ <= 0 &&
-        this->followup_group_remaining_ <= 0) {
+        this->followup_group_remaining_ <= 0 &&
+        now >= this->poll_cooldown_until_) {
       auto mid_str = this->poll_queue_.front();
       this->poll_queue_.erase(this->poll_queue_.begin());
       uint8_t mid[4];
       parse_motor_id(mid_str, mid);
-      ESP_LOGI(TAG, "Poll queue: sending STATUS_QUERY to %s (%d remaining)",
+      ESP_LOGI(TAG, "Poll queue: sending STOP to %s (%d remaining)",
                mid_str.c_str(), static_cast<int>(this->poll_queue_.size()));
       this->request_status(mid);
+      this->poll_cooldown_until_ = now + POLL_COOLDOWN_MS;
     }
 
     // Group follow-ups: retransmit all group commands per round
@@ -179,17 +181,12 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->schedule_followups_(motor_id, action, value);
   }
 
-  // Poll a motor for status (battery + position) using action 0x2A.
-  // The Tuya hub sends this after pairing; the motor responds with STATUS.
+  // Poll a motor for status (battery + position).
+  // Sends a STOP command — harmless if motor is already stopped, but
+  // triggers the full TX/RX cycling that elicits STATUS reports.
+  // (0x2A STATUS_QUERY only gets ACKs; STOP triggers actual STATUS.)
   void request_status(const uint8_t *motor_id) {
-    uint8_t seq = this->next_seq();
-    uint8_t action = static_cast<uint8_t>(SunfreeCmd::STATUS_QUERY);
-    std::vector<uint8_t> pkt = build_n4_command(
-        this->hub_id_, motor_id, seq, action, 0x00, this->swap_fields_);
-    ESP_LOGI(TAG, "TX STATUS_QUERY seq=0x%02x motor=%s", seq,
-             format_motor_id(motor_id).c_str());
-    this->transmit_with_preamble_(pkt);
-    this->schedule_followups_(motor_id, action, 0x00);
+    this->send_command(motor_id, ACTION_STOP);
   }
 
   float get_last_rssi() const { return this->last_rssi_; }
@@ -238,10 +235,11 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   void on_request_status_(std::string motor_id) {
     if (motor_id == "all") {
       this->poll_queue_.clear();
+      this->poll_cooldown_until_ = 0;
       for (auto &kv : this->covers_) {
         this->poll_queue_.push_back(kv.first);
       }
-      ESP_LOGI(TAG, "Queued STATUS_QUERY for %d motors",
+      ESP_LOGI(TAG, "Queued STOP poll for %d motors",
                static_cast<int>(this->poll_queue_.size()));
       return;
     }
@@ -438,6 +436,8 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // Queued status poll — process one motor at a time with full TX/RX
   // cycling between each, so motors get proper follow-ups.
   std::vector<std::string> poll_queue_;
+  uint32_t poll_cooldown_until_{0};
+  static constexpr uint32_t POLL_COOLDOWN_MS = 500;
 
   // Raw capture for replay testing
   std::vector<uint8_t> captured_raw_;
