@@ -416,7 +416,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // alignment with the CC1101's internal 40 kbps clock.
   // Static TX buffer avoids heap allocation during the critical-section
   // bit-bang, preventing heap corruption that crashes the SPI driver.
-  static constexpr int TX_BUF_MAX_ = 1100;
+  static constexpr int TX_BUF_MAX_ = 1900;
   uint8_t tx_buf_[TX_BUF_MAX_];
 
   void bitbang_tx_(int total) {
@@ -474,7 +474,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     ESP_LOGI(TAG, "TX async preamble+cmd, frame (%d bytes, CRC=0x%02x): %s",
              pkt_sz, pkt_sz > 3 ? pkt[pkt_sz - 1] : 0, hex);
 
-    static constexpr int PREAMBLE_BYTES = 800;
+    static constexpr int PREAMBLE_BYTES = 1600;  // 320ms WOR preamble for better range
     int cmd_len = static_cast<int>(pkt.size()) - 2;
     int total = PREAMBLE_BYTES + 4 + cmd_len + 10;
     if (total > TX_BUF_MAX_) {
@@ -495,7 +495,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     // Skip during pairing scan -- the motor responds immediately and we
     // need a clean RX window to catch the short response burst.
     if (!this->scan_active_) {
-      this->transmit_command_only_(pkt, 2);
+      this->transmit_command_only_(pkt, 4);
     }
   }
 
@@ -503,7 +503,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // sync word.  All motors are awake from the WOR preamble so they all
   // receive their command within milliseconds of each other.
   void transmit_group_with_preamble_(std::vector<std::vector<uint8_t>> &pkts) {
-    static constexpr int PREAMBLE_BYTES = 800;
+    static constexpr int PREAMBLE_BYTES = 1600;  // 320ms WOR preamble for better range
     static constexpr int GAP_BYTES = 20;
 
     int payload_total = 0;
@@ -530,9 +530,9 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
     this->bitbang_tx_(total);
 
-    // Retransmit each command once more in packet mode (motors are awake)
+    // Retransmit each command twice in packet mode (motors are awake)
     for (auto &pkt : pkts) {
-      this->transmit_command_only_(pkt, 1);
+      this->transmit_command_only_(pkt, 2);
     }
   }
 
