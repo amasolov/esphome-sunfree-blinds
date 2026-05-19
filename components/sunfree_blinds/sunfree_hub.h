@@ -276,12 +276,11 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     ESP_LOGI(TAG, "Motor paired! ID=%s", mid);
     this->pairing_status_ = "PAIRED: " + mid_str;
 
-    // Add to discovered list if not already known (paired or configured)
-    bool already_known = this->covers_.count(mid_str) > 0;
+    bool already_listed = false;
     for (auto &d : this->discovered_ids_) {
-      if (d == mid_str) { already_known = true; break; }
+      if (d == mid_str) { already_listed = true; break; }
     }
-    if (!already_known) {
+    if (!already_listed) {
       this->discovered_ids_.push_back(mid_str);
       ESP_LOGI(TAG, "New motor discovered: %s (total discovered: %d)",
                mid, static_cast<int>(this->discovered_ids_.size()));
