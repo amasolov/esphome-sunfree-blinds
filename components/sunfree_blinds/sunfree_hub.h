@@ -268,14 +268,28 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   }
 
   void send_pairing_response(const uint8_t *resp_dec16) {
-    // Motor responded to our discovery. Extract motor address from bytes 3-6.
     const uint8_t *motor_addr = resp_dec16 + 3;
     char mid[20];
     snprintf(mid, sizeof(mid), "%02x%02x%02x%02x",
              motor_addr[0], motor_addr[1], motor_addr[2], motor_addr[3]);
-    ESP_LOGI(TAG, "Pairing: motor addr from response = %s", mid);
-    this->pairing_status_ = std::string("PAIRED: ") + mid;
+    std::string mid_str(mid);
     ESP_LOGI(TAG, "Motor paired! ID=%s", mid);
+    this->pairing_status_ = "PAIRED: " + mid_str;
+
+    // Add to discovered list if not already known (paired or configured)
+    bool already_known = this->covers_.count(mid_str) > 0;
+    for (auto &d : this->discovered_ids_) {
+      if (d == mid_str) { already_known = true; break; }
+    }
+    if (!already_known) {
+      this->discovered_ids_.push_back(mid_str);
+      ESP_LOGI(TAG, "New motor discovered: %s (total discovered: %d)",
+               mid, static_cast<int>(this->discovered_ids_.size()));
+    }
+  }
+
+  const std::vector<std::string> &get_discovered_ids() const {
+    return this->discovered_ids_;
   }
 
  protected:
@@ -307,6 +321,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   static constexpr uint32_t SCAN_TIMEOUT_MS = 120000;    // 120 seconds
   static constexpr uint32_t SOLICIT_INTERVAL_MS = 1500;   // TX every 1.5s (160ms TX + listen gap)
   std::string pairing_status_{"idle"};
+  std::vector<std::string> discovered_ids_;
 
   // Raw capture for replay testing
   std::vector<uint8_t> captured_raw_;

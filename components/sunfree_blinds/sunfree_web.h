@@ -31,6 +31,8 @@ h1{font-size:1.3em;margin-bottom:8px;color:#64b5f6}
 .pair-box{background:#16213e;border-radius:8px;padding:14px;margin-bottom:10px}
 .pair-box h2{font-size:1em;margin-bottom:8px;color:#ffab40}
 .status{color:#81c784;font-family:monospace;font-size:.85em}
+.disc{margin-top:8px;font-size:.85em}
+.disc code{background:#0d1b2a;padding:2px 8px;border-radius:4px;font-size:1em;user-select:all;color:#ffab40}
 </style></head><body>
 <h1>Sunfree Blinds</h1>
 <div class="hub">Hub ID: <span id="hid">...</span></div>
@@ -39,6 +41,7 @@ h1{font-size:1.3em;margin-bottom:8px;color:#64b5f6}
 <div class="row"><button class="btn b-pair" onclick="pair('start')">Start Scan</button>
 <button class="btn b-pair active" onclick="pair('stop')">Stop Scan</button></div>
 <div class="status" id="pstatus">...</div>
+<div id="discovered"></div>
 </div>
 <div id="motors"></div>
 <script>
@@ -52,6 +55,12 @@ function grpPos(g,el){grp(g,'position',el.value)}
 function render(d){
   document.getElementById('hid').textContent=d.hub_id;
   document.getElementById('pstatus').textContent=d.pairing;
+  let dd=document.getElementById('discovered');
+  if(d.discovered&&d.discovered.length){
+    let dh='<div class="disc"><b>Discovered motor IDs</b> (add to YAML):<br>';
+    d.discovered.forEach(id=>{dh+='<code>'+id+'</code> '});
+    dh+='</div>';dd.innerHTML=dh;
+  } else {dd.innerHTML='';}
   const c=document.getElementById('motors');
   if(!d.motors||!d.motors.length){c.innerHTML='<div class="card"><em>No motors configured</em></div>';return}
   let h='';
@@ -222,6 +231,12 @@ inline void SunfreeHub::setup_web_() {
 inline std::string SunfreeHub::get_motors_json() {
   std::string json = "{\"hub_id\":\"" + format_motor_id(this->hub_id_) + "\",";
   json += "\"pairing\":\"" + this->pairing_status_ + "\",";
+  json += "\"discovered\":[";
+  for (size_t i = 0; i < this->discovered_ids_.size(); i++) {
+    if (i) json += ",";
+    json += "\"" + this->discovered_ids_[i] + "\"";
+  }
+  json += "],";
   json += "\"groups\":[";
   bool gfirst = true;
   for (auto &grp : this->groups_) {
