@@ -185,7 +185,21 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
                          this->piggyback_position_);
       }
     } else {
-      this->last_rx_info_ = "ACK parse_fail";
+      uint8_t extracted[12];
+      d492_extract_payload(data.data(), data.size(), extracted, 12);
+      uint32_t w3[3];
+      memcpy(w3, extracted, 12);
+      xxtea_decrypt(w3, 3, SUNFREE_KEY);
+      uint8_t d3[12];
+      memcpy(d3, w3, 12);
+      ESP_LOGW(TAG, "ACK parse_fail: dec[0]=0x%02x hub=%02x%02x%02x%02x motor=%02x%02x%02x%02x flags=0x%02x",
+               d3[0], d3[3], d3[4], d3[5], d3[6],
+               d3[7], d3[8], d3[9], d3[10], d3[11]);
+      char buf[120];
+      snprintf(buf, sizeof(buf), "ACK parse_fail dec[0]=0x%02x hub=%02x%02x%02x%02x motor=%02x%02x%02x%02x",
+               d3[0], d3[3], d3[4], d3[5], d3[6],
+               d3[7], d3[8], d3[9], d3[10]);
+      this->last_rx_info_ = buf;
     }
 
   } else if (pkt_len == 16) {
@@ -315,10 +329,29 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
     } else {
       uint8_t extracted[24];
       d492_extract_payload(data.data(), data.size(), extracted, 24);
+
+      // Decrypt and dump both raw and decrypted for diagnostics
+      uint32_t words6[6];
+      memcpy(words6, extracted, 24);
+      xxtea_decrypt(words6, 6, SUNFREE_KEY);
+      uint8_t dec6[24];
+      memcpy(dec6, words6, 24);
+
       char hx[24 * 3 + 1];
       for (int i = 0; i < 24; i++) snprintf(hx + i * 3, 4, "%02x ", extracted[i]);
-      char buf[120];
-      snprintf(buf, sizeof(buf), "STATUS parse_fail raw=%s", hx);
+      char dx[24 * 3 + 1];
+      for (int i = 0; i < 24; i++) snprintf(dx + i * 3, 4, "%02x ", dec6[i]);
+
+      ESP_LOGW(TAG, "STATUS parse_fail: raw=%s", hx);
+      ESP_LOGW(TAG, "STATUS parse_fail: dec=%s", dx);
+      ESP_LOGW(TAG, "STATUS parse_fail: dec[0]=0x%02x (need 0x0B) hub=%02x%02x%02x%02x motor=%02x%02x%02x%02x",
+               dec6[0], dec6[3], dec6[4], dec6[5], dec6[6],
+               dec6[7], dec6[8], dec6[9], dec6[10]);
+
+      char buf[180];
+      snprintf(buf, sizeof(buf), "STATUS parse_fail dec[0]=0x%02x hub=%02x%02x%02x%02x motor=%02x%02x%02x%02x",
+               dec6[0], dec6[3], dec6[4], dec6[5], dec6[6],
+               dec6[7], dec6[8], dec6[9], dec6[10]);
       this->last_rx_info_ = buf;
     }
 
