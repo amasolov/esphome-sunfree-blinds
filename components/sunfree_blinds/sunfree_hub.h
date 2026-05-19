@@ -220,7 +220,9 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   void on_request_status_(std::string motor_id) {
     if (motor_id == "all") {
       for (auto &kv : this->covers_) {
-        this->request_status(kv.second->get_motor_id());
+        uint8_t mid[4];
+        parse_motor_id(kv.first, mid);
+        this->request_status(mid);
       }
       return;
     }
