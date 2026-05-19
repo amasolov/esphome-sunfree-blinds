@@ -292,6 +292,16 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     return this->discovered_ids_;
   }
 
+  std::string get_discovered_ids_str() const {
+    if (this->discovered_ids_.empty()) return "none";
+    std::string result;
+    for (size_t i = 0; i < this->discovered_ids_.size(); i++) {
+      if (i) result += ", ";
+      result += this->discovered_ids_[i];
+    }
+    return result;
+  }
+
  protected:
   cc1101::CC1101Component *radio_{nullptr};
   web_server_base::WebServerBase *web_base_{nullptr};
