@@ -422,9 +422,10 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   void bitbang_tx_(int total) {
     this->radio_->set_crc_enable(false);
     this->radio_->set_whitening(false);
-    // Use 433.950 MHz for all TX — matches the Tuya hub's actual on-air frequency
-    // (RTL-SDR confirmed the hub sends at 433.950, not 433.933)
-    this->radio_->set_frequency(433950000.0f);
+    // TX at 433.933 MHz during pairing (motor WOR listens here),
+    // 433.950 MHz for normal commands (motor is already awake).
+    float tx_freq = this->scan_active_ ? 433933000.0f : 433950000.0f;
+    this->radio_->set_frequency(tx_freq);
     this->radio_->set_packet_mode(false);
     this->radio_->begin_tx();
 
@@ -465,8 +466,8 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->restore_rx_();
 
     int64_t elapsed_us = esp_timer_get_time() - t0;
-    ESP_LOGI(TAG, "Async TX complete (%lldms), RX restored at 433.950 MHz%s",
-             elapsed_us / 1000,
+    ESP_LOGI(TAG, "Async TX complete (%lldms) TX=%.3f RX=433.950 MHz%s",
+             elapsed_us / 1000, tx_freq / 1e6,
              this->scan_active_ ? " [SCAN]" : "");
   }
 
