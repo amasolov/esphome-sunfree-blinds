@@ -486,8 +486,12 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     int64_t elapsed_us = esp_timer_get_time() - t0;
     ESP_LOGI(TAG, "Async TX complete (%lldms), restored RX", elapsed_us / 1000);
 
-    // Phase 3: retransmissions using packet mode (motor should be awake now)
-    this->transmit_command_only_(pkt, 2);
+    // Phase 3: retransmissions using packet mode (motor should be awake now).
+    // Skip during pairing scan -- the motor responds immediately and we
+    // need a clean RX window to catch the short response burst.
+    if (!this->scan_active_) {
+      this->transmit_command_only_(pkt, 2);
+    }
   }
 
   // Single preamble followed by multiple command packets, each with its own
@@ -617,7 +621,10 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->radio_->set_idle();
     this->radio_->set_crc_enable(false);
     this->radio_->set_whitening(false);
-    this->radio_->set_frequency(433950000.0f);
+    // During pairing scan, listen on the TX frequency (433.920 MHz actual)
+    // since the motor responds on the frequency it received on.
+    float rx_freq = this->scan_active_ ? 433933000.0f : 433950000.0f;
+    this->radio_->set_frequency(rx_freq);
     this->radio_->set_sync1(0xD4);
     this->radio_->set_sync0(0x92);
     this->radio_->set_packet_length(CC1101_PKT_LEN);

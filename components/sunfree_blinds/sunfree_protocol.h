@@ -424,7 +424,8 @@ inline bool parse_pairing_response(const uint8_t *cc, int cc_len, SunfreePairing
   memcpy(dec, words, 16);
   memcpy(dec + 16, data + 16, 4);  // cleartext tail
 
-  if (dec[0] != 0x0B || dec[2] != 0x02) return false;
+  if (dec[0] != 0x0B) return false;
+  // dec[2] varies by motor revision: 0x02 (original capture), 0x05 (AC2001-15D)
 
   // Night motor ID at bytes 3-6
   memcpy(resp.night_id, dec + 3, 4);
