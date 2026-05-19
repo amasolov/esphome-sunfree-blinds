@@ -51,7 +51,9 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
     register_service(&SunfreeHub::on_send_config_, "send_config",
                      {"motor_id", "action_type"});
-    ESP_LOGI(TAG, "Registered service: send_config(motor_id, action_type)");
+    register_service(&SunfreeHub::on_group_command_, "group_command",
+                     {"group", "action"});
+    ESP_LOGI(TAG, "Registered services: send_config, group_command");
 
     if (this->web_base_) this->setup_web_();
   }
@@ -101,6 +103,21 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->arm_piggyback_(motor_id, action, position);
   }
 
+  void add_group(const std::string &name, std::vector<std::string> motor_ids) {
+    this->groups_[name] = std::move(motor_ids);
+    ESP_LOGI(TAG, "Group '%s' added with %d motors", name.c_str(),
+             static_cast<int>(this->groups_[name].size()));
+  }
+
+  const std::map<std::string, std::vector<std::string>> &get_groups() const {
+    return this->groups_;
+  }
+
+  // Send a command to a named group (single WOR preamble, all motors move together).
+  // Use group="" for all motors.
+  // Implemented in sunfree_cover.h where SunfreeCover is fully defined.
+  void send_group_command(const std::string &group, uint8_t action, uint8_t position = 0);
+
   // Send a configuration command (limits, direction, favourite, etc.)
   // Uses n=4 XXTEA encryption with arbitrary action+value bytes.
   void send_config(const uint8_t *motor_id, uint8_t action, uint8_t value) {
@@ -148,6 +165,26 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     ESP_LOGI(TAG, "Service send_config: motor=%s action=%s (0x%02X/0x%02X)",
              motor_id.c_str(), action_type.c_str(), action, value);
     this->send_config(mid, action, value);
+  }
+
+  void on_group_command_(std::string group, std::string action_str) {
+    uint8_t action;
+    uint8_t position = 0;
+    if (action_str == "open") {
+      action = ACTION_OPEN;
+    } else if (action_str == "close") {
+      action = ACTION_CLOSE;
+    } else if (action_str == "stop") {
+      action = ACTION_STOP;
+    } else if (action_str.substr(0, 9) == "position_") {
+      action = ACTION_POSITION;
+      position = static_cast<uint8_t>(std::atoi(action_str.substr(9).c_str()));
+    } else {
+      ESP_LOGW(TAG, "group_command: unknown action '%s'", action_str.c_str());
+      return;
+    }
+    ESP_LOGI(TAG, "Service group_command: group='%s' action=%s", group.c_str(), action_str.c_str());
+    this->send_group_command(group, action, position);
   }
 
  public:
@@ -250,6 +287,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   uint8_t overheard_seq_{0};
   bool have_overheard_seq_{false};
   std::map<std::string, SunfreeCover *> covers_;
+  std::map<std::string, std::vector<std::string>> groups_;
   bool swap_fields_{false};
 
   // Auto-piggyback state: fires command on next status report from target motor
@@ -427,6 +465,73 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
     // Phase 3: retransmissions using packet mode (motor should be awake now)
     this->transmit_command_only_(pkt, 2);
+  }
+
+  // Single preamble followed by multiple command packets, each with its own
+  // sync word.  All motors are awake from the WOR preamble so they all
+  // receive their command within milliseconds of each other.
+  void transmit_group_with_preamble_(std::vector<std::vector<uint8_t>> &pkts) {
+    static constexpr int PREAMBLE_BYTES = 800;
+    static constexpr int GAP_BYTES = 20;  // ~4ms re-sync gap between commands
+
+    int payload_total = 0;
+    for (auto &pkt : pkts) {
+      payload_total += 4 + (static_cast<int>(pkt.size()) - 2) + GAP_BYTES;
+    }
+    int total = PREAMBLE_BYTES + payload_total + 10;
+    std::vector<uint8_t> stream(total);
+
+    int p = 0;
+    for (int i = 0; i < PREAMBLE_BYTES; i++) stream[p++] = 0xAA;
+    for (auto &pkt : pkts) {
+      stream[p++] = 0x53; stream[p++] = 0x52;
+      stream[p++] = 0x4A; stream[p++] = 0x44;
+      for (int i = 2; i < static_cast<int>(pkt.size()); i++) stream[p++] = pkt[i];
+      for (int i = 0; i < GAP_BYTES; i++) stream[p++] = 0xAA;
+    }
+    while (p < total) stream[p++] = 0xAA;
+
+    this->radio_->set_crc_enable(false);
+    this->radio_->set_whitening(false);
+    this->radio_->set_frequency(433933000.0f);
+    this->radio_->set_packet_mode(false);
+    this->radio_->begin_tx();
+    gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
+
+    ESP_LOGI(TAG, "GROUP WOR: %d bytes stream (%dms), %d motors",
+             total, total * 8 / 40, static_cast<int>(pkts.size()));
+
+    int64_t t0 = esp_timer_get_time();
+    int bit_idx = 0;
+    portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
+    portENTER_CRITICAL(&mux);
+    for (int b = 0; b < total; b++) {
+      uint8_t byte = stream[b];
+      for (int bit = 7; bit >= 0; bit--) {
+        int64_t target = t0 + static_cast<int64_t>(bit_idx) * 25;
+        while (esp_timer_get_time() < target) {}
+        gpio_set_level(GPIO_NUM_4, (byte >> bit) & 1);
+        bit_idx++;
+      }
+      if ((b & 0xFF) == 0xFF) {
+        portEXIT_CRITICAL(&mux);
+        portENTER_CRITICAL(&mux);
+      }
+    }
+    portEXIT_CRITICAL(&mux);
+
+    this->radio_->begin_rx();
+    this->radio_->set_packet_mode(true);
+    this->restore_rx_();
+
+    int64_t elapsed_us = esp_timer_get_time() - t0;
+    ESP_LOGI(TAG, "GROUP TX complete (%lldms), %d cmds sent", elapsed_us / 1000,
+             static_cast<int>(pkts.size()));
+
+    // Retransmit each command once more in packet mode (motors are awake)
+    for (auto &pkt : pkts) {
+      this->transmit_command_only_(pkt, 1);
+    }
   }
 
   // Send just the command packet (no preamble), for piggyback or post-preamble.

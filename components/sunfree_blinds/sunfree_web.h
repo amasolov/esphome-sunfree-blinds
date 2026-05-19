@@ -46,13 +46,26 @@ const B='/sunfree';
 function post(p){return fetch(B+'/cmd?'+p,{method:'POST'}).then(r=>r.json())}
 function pair(a){post('action=pair_'+a)}
 function cmd(m,a,v){let q='motor='+m+'&action='+a;if(v!==undefined)q+='&value='+v;post(q)}
+function grp(g,a,v){let q='action=group_'+a+'&group='+encodeURIComponent(g);if(v!==undefined)q+='&value='+v;post(q)}
 function setPos(m,el){cmd(m,'position',el.value)}
+function grpPos(g,el){grp(g,'position',el.value)}
 function render(d){
   document.getElementById('hid').textContent=d.hub_id;
   document.getElementById('pstatus').textContent=d.pairing;
   const c=document.getElementById('motors');
   if(!d.motors||!d.motors.length){c.innerHTML='<div class="card"><em>No motors configured</em></div>';return}
   let h='';
+  function groupCard(name,label){
+    h+='<div class="card" style="border:1px solid #64b5f6"><h2 style="color:#64b5f6">'+label+'</h2>';
+    h+='<div class="pos"><span></span><input type="range" min="0" max="100" value="0" onchange="grpPos(\''+name+'\',this)"><span></span></div>';
+    h+='<div class="row">';
+    h+='<button class="btn b-open" onclick="grp(\''+name+'\',\'open\')">Open</button>';
+    h+='<button class="btn b-stop" onclick="grp(\''+name+'\',\'stop\')">Stop</button>';
+    h+='<button class="btn b-close" onclick="grp(\''+name+'\',\'close\')">Close</button>';
+    h+='</div></div>';
+  }
+  if(d.groups&&d.groups.length){d.groups.forEach(g=>groupCard(g.name,g.name+' ('+g.motor_ids.length+')'));}
+  groupCard('','All Motors ('+d.motors.length+')');
   d.motors.forEach(m=>{
     let pct=Math.round((1-m.position)*100);
     let op=m.operation==='OPENING'?'Opening':m.operation==='CLOSING'?'Closing':'Idle';
@@ -127,6 +140,26 @@ class SunfreeWebHandler : public AsyncWebHandler {
         return;
       }
 
+      if (action.substr(0, 6) == "group_") {
+        std::string grp_action = action.substr(6);
+        std::string group = this->get_arg_(request, "group");
+        uint8_t act, pos = 0;
+        if (grp_action == "open") act = ACTION_OPEN;
+        else if (grp_action == "close") act = ACTION_CLOSE;
+        else if (grp_action == "stop") act = ACTION_STOP;
+        else if (grp_action == "position") {
+          act = ACTION_POSITION;
+          std::string val = this->get_arg_(request, "value");
+          pos = val.empty() ? 0 : static_cast<uint8_t>(std::atoi(val.c_str()));
+        } else {
+          request->send(400, "application/json", "{\"error\":\"unknown group action\"}");
+          return;
+        }
+        this->hub_->send_group_command(group, act, pos);
+        request->send(200, "application/json", "{\"ok\":true}");
+        return;
+      }
+
       if (motor.empty()) {
         request->send(400, "application/json", "{\"error\":\"missing motor\"}");
         return;
@@ -189,7 +222,21 @@ inline void SunfreeHub::setup_web_() {
 inline std::string SunfreeHub::get_motors_json() {
   std::string json = "{\"hub_id\":\"" + format_motor_id(this->hub_id_) + "\",";
   json += "\"pairing\":\"" + this->pairing_status_ + "\",";
-  json += "\"motors\":[";
+  json += "\"groups\":[";
+  bool gfirst = true;
+  for (auto &grp : this->groups_) {
+    if (!gfirst) json += ",";
+    gfirst = false;
+    json += "{\"name\":\"" + grp.first + "\",\"motor_ids\":[";
+    bool mfirst = true;
+    for (auto &mid : grp.second) {
+      if (!mfirst) json += ",";
+      mfirst = false;
+      json += "\"" + mid + "\"";
+    }
+    json += "]}";
+  }
+  json += "],\"motors\":[";
   bool first = true;
   for (auto &pair : this->covers_) {
     if (!first) json += ",";

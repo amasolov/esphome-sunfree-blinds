@@ -343,6 +343,55 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
   }
 }
 
+inline void SunfreeHub::send_group_command(const std::string &group,
+                                           uint8_t action, uint8_t position) {
+  std::vector<SunfreeCover *> targets;
+  if (group.empty()) {
+    for (auto &pair : this->covers_) targets.push_back(pair.second);
+  } else {
+    auto it = this->groups_.find(group);
+    if (it == this->groups_.end()) {
+      ESP_LOGW(TAG, "GROUP '%s' not found", group.c_str());
+      return;
+    }
+    for (auto &mid : it->second) {
+      auto cit = this->covers_.find(mid);
+      if (cit != this->covers_.end()) targets.push_back(cit->second);
+    }
+  }
+  if (targets.empty()) {
+    ESP_LOGW(TAG, "GROUP '%s': no matching covers", group.c_str());
+    return;
+  }
+
+  std::vector<std::vector<uint8_t>> pkts;
+  for (auto *c : targets) {
+    uint8_t seq = this->next_seq();
+    pkts.push_back(this->build_command_packet_(c->get_motor_id(), action, position, seq));
+    ESP_LOGI(TAG, "GROUP[%s] TX %s seq=0x%02x motor=%s",
+             group.empty() ? "all" : group.c_str(), action_name_(action),
+             seq, c->get_motor_id_str().c_str());
+  }
+  this->transmit_group_with_preamble_(pkts);
+
+  float target_pos = -1;
+  if (action == ACTION_OPEN) target_pos = 1.0f;
+  else if (action == ACTION_CLOSE) target_pos = 0.0f;
+  else if (action == ACTION_POSITION) target_pos = 1.0f - (position / 100.0f);
+  for (auto *c : targets) {
+    if (action == ACTION_STOP) {
+      c->current_operation = cover::COVER_OPERATION_IDLE;
+    } else if (target_pos >= 0) {
+      float prev = c->position;
+      c->position = target_pos;
+      c->current_operation = (target_pos > prev)
+                                 ? cover::COVER_OPERATION_OPENING
+                                 : cover::COVER_OPERATION_CLOSING;
+    }
+    c->publish_state();
+  }
+}
+
 }  // namespace sunfree_blinds
 }  // namespace esphome
 
