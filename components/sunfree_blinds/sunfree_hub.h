@@ -252,8 +252,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
   void stop_scan() {
     this->scan_active_ = false;
-    if (this->pairing_status_ == "SCANNING...")
-      this->pairing_status_ = "STOPPED";
+    this->pairing_status_ = "STOPPED";
     ESP_LOGI(TAG, "Pairing scan STOPPED");
   }
 
