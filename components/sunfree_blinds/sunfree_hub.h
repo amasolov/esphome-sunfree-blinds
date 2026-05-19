@@ -327,7 +327,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   uint32_t solicit_count_{0};
   std::vector<uint8_t> solicit_frame_;
   static constexpr uint32_t SCAN_TIMEOUT_MS = 120000;    // 120 seconds
-  static constexpr uint32_t SOLICIT_INTERVAL_MS = 1500;   // TX every 1.5s (160ms TX + listen gap)
+  static constexpr uint32_t SOLICIT_INTERVAL_MS = 2500;   // TX every 2.5s (320ms TX + listen gap)
   std::string pairing_status_{"idle"};
   std::vector<std::string> discovered_ids_;
 
