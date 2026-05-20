@@ -3,9 +3,7 @@
 #include "esphome/core/log.h"
 #include "esphome/core/preferences.h"
 #include "esphome/components/api/custom_api_device.h"
-#ifdef USE_WEBSERVER_BASE
 #include "esphome/components/web_server_base/web_server_base.h"
-#endif
 #include "esphome/components/cc1101/cc1101.h"
 #include "sunfree_protocol.h"
 #include <map>
@@ -34,9 +32,7 @@ class SunfreeCover;
 class SunfreeHub : public Component, public api::CustomAPIDevice {
  public:
   void set_cc1101(cc1101::CC1101Component *radio) { this->radio_ = radio; }
-#ifdef USE_WEBSERVER_BASE
   void set_web_base(web_server_base::WebServerBase *base) { this->web_base_ = base; }
-#endif
   void set_hub_id(const std::string &id) {
     parse_motor_id(id, this->hub_id_);
     this->hub_id_from_yaml_ = true;
@@ -59,63 +55,13 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
                      {"group", "action"});
     ESP_LOGI(TAG, "Registered services: send_config, group_command");
 
-#ifdef USE_WEBSERVER_BASE
     if (this->web_base_) this->setup_web_();
-#endif
   }
 
   void loop() override {
-    uint32_t now = millis();
-
-    // Follow-up retransmissions with RX gaps — mimics the Tuya hub's
-    // TX/RX cycling.  Each follow-up is rebuilt with a FRESH seq so the
-    // motor doesn't deduplicate.  The hub sends 6-8 TX/RX cycles ~200ms
-    // apart; the motor sends STATUS after several rounds.
-    if (this->followup_remaining_ > 0 && now >= this->followup_next_ms_) {
-      int idx = this->followup_total_ - this->followup_remaining_;
-      uint8_t seq = this->next_seq();
-      auto pkt = this->build_followup_pkt_(seq);
-      ESP_LOGD(TAG, "Follow-up TX %d/%d seq=0x%02x", idx + 1, this->followup_total_, seq);
-      this->transmit_command_only_(pkt, 1);
-      this->followup_remaining_--;
-      if (this->followup_remaining_ > 0) {
-        this->followup_next_ms_ = now + FOLLOWUP_GAP_MS;
-      }
-    }
-
-    // Queued status poll: process one motor at a time with full TX/RX
-    // cycling + cooldown before moving to the next.  The cooldown gives
-    // late STATUS responses time to arrive before the next WOR blocks RX.
-    if (!this->poll_queue_.empty() && this->followup_remaining_ <= 0 &&
-        this->followup_group_remaining_ <= 0 &&
-        now >= this->poll_cooldown_until_) {
-      auto mid_str = this->poll_queue_.front();
-      this->poll_queue_.erase(this->poll_queue_.begin());
-      uint8_t mid[4];
-      parse_motor_id(mid_str, mid);
-      ESP_LOGI(TAG, "Poll queue: sending STOP to %s (%d remaining)",
-               mid_str.c_str(), static_cast<int>(this->poll_queue_.size()));
-      this->request_status(mid);
-      this->poll_cooldown_until_ = now + POLL_COOLDOWN_MS;
-    }
-
-    // Group follow-ups: retransmit all group commands per round
-    if (this->followup_group_remaining_ > 0 && this->followup_remaining_ <= 0 &&
-        now >= this->followup_next_ms_) {
-      ESP_LOGD(TAG, "Group follow-up %d/%d (%d motors)",
-               FOLLOWUP_COUNT_CMD - this->followup_group_remaining_ + 1,
-               FOLLOWUP_COUNT_CMD,
-               static_cast<int>(this->followup_group_pkts_.size()));
-      for (auto &pkt : this->followup_group_pkts_) {
-        this->transmit_command_only_(pkt, 1);
-      }
-      this->followup_group_remaining_--;
-      if (this->followup_group_remaining_ > 0) {
-        this->followup_next_ms_ = now + FOLLOWUP_GAP_MS;
-      }
-    }
-
     if (!this->scan_active_) return;
+
+    uint32_t now = millis();
 
     // Check scan timeout
     if (now - this->scan_start_ms_ > SCAN_TIMEOUT_MS) {
@@ -152,7 +98,6 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     ESP_LOGI(TAG, "TX %s seq=0x%02x motor=%s", act_name, seq,
              format_motor_id(motor_id).c_str());
     this->transmit_with_preamble_(pkt);
-    this->schedule_followups_(motor_id, action, position, true);
 
     // Also arm auto-piggyback as fallback for deep-sleeping motors
     this->arm_piggyback_(motor_id, action, position);
@@ -182,32 +127,10 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     ESP_LOGI(TAG, "TX CONFIG action=0x%02x value=0x%02x seq=0x%02x motor=%s",
              action, value, seq, format_motor_id(motor_id).c_str());
     this->transmit_with_preamble_(pkt);
-    this->schedule_followups_(motor_id, action, value);
   }
-
-  // Poll a motor for status (battery + position).
-  // Sends a STOP command — harmless if motor is already stopped, but
-  // triggers the full TX/RX cycling that elicits STATUS reports.
-  // Uses FOLLOWUP_COUNT_POLL (6) instead of FOLLOWUP_COUNT_CMD (2).
-  void request_status(const uint8_t *motor_id) {
-    uint8_t seq = this->next_seq();
-    auto pkt = this->build_command_packet_(motor_id, ACTION_STOP, 0, seq);
-    ESP_LOGI(TAG, "TX POLL (STOP) seq=0x%02x motor=%s", seq,
-             format_motor_id(motor_id).c_str());
-    this->transmit_with_preamble_(pkt);
-    this->schedule_followups_(motor_id, ACTION_STOP, 0, false);
-  }
-
-  float get_last_rssi() const { return this->last_rssi_; }
 
  protected:
   void on_send_config_(std::string motor_id, std::string action_type) {
-    // "request_status" with "all" queues STOP poll for every motor
-    if (action_type == "request_status" && motor_id == "all") {
-      this->on_request_status_all_();
-      return;
-    }
-
     uint8_t mid[4];
     if (motor_id.length() != 8) {
       ESP_LOGW(TAG, "send_config: motor_id must be 8 hex chars, got '%s'", motor_id.c_str());
@@ -234,9 +157,6 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     } else if (action_type == "goto_favourite") {
       action = static_cast<uint8_t>(SunfreeCmd::GOTO_FAVOURITE);
       value = GOTO_FAV_VALUE;
-    } else if (action_type == "request_status") {
-      this->request_status(mid);
-      return;
     } else {
       ESP_LOGW(TAG, "send_config: unknown action_type '%s'", action_type.c_str());
       return;
@@ -245,16 +165,6 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     ESP_LOGI(TAG, "Service send_config: motor=%s action=%s (0x%02X/0x%02X)",
              motor_id.c_str(), action_type.c_str(), action, value);
     this->send_config(mid, action, value);
-  }
-
-  void on_request_status_all_() {
-    this->poll_queue_.clear();
-    this->poll_cooldown_until_ = 0;
-    for (auto &kv : this->covers_) {
-      this->poll_queue_.push_back(kv.first);
-    }
-    ESP_LOGI(TAG, "Queued STOP poll for %d motors",
-             static_cast<int>(this->poll_queue_.size()));
   }
 
   void on_group_command_(std::string group, std::string action_str) {
@@ -288,10 +198,34 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->transmit_command_only_(pkt, 3);
   }
 
+  // Replay: retransmit a captured hub CMD packet on the TX path
+  // This tests whether our RF parameters can deliver a known-good packet.
+  // The captured D492 RX frame must be bit-shifted back to CMT2300A framing.
+  void replay_captured() {
+    if (!this->have_capture_) {
+      ESP_LOGW(TAG, "Replay: no capture available");
+      this->piggyback_status_ = "REPLAY: no capture";
+      return;
+    }
+    // Extract the CMT2300A payload (16 bytes) from the D492 RX frame
+    uint8_t payload[16];
+    if (!d492_extract_payload(this->captured_raw_.data(), this->captured_raw_.size(), payload, 16)) {
+      ESP_LOGW(TAG, "Replay: extraction failed");
+      this->piggyback_status_ = "REPLAY: extract fail";
+      return;
+    }
+    // Build a TX frame from the extracted payload (includes CRC-8)
+    std::vector<uint8_t> frame = build_tx_frame(payload, 16);
+    char hex[30 * 3 + 1];
+    for (int i = 0; i < static_cast<int>(frame.size()); i++) snprintf(hex + i * 3, 4, "%02x ", frame[i]);
+    ESP_LOGI(TAG, "REPLAY TX frame: %s", hex);
+    this->piggyback_status_ = "REPLAYING...";
+    this->transmit_with_preamble_(frame);
+    this->piggyback_status_ = "REPLAYED";
+  }
+
   std::string get_hub_id_str() const { return format_motor_id(this->hub_id_); }
-#ifdef USE_WEBSERVER_BASE
   std::string get_motors_json();  // implemented in sunfree_web.h
-#endif
 
   uint32_t get_rx_packet_count() const { return this->rx_packet_count_; }
   uint32_t get_rx_valid_count() const { return this->rx_valid_count_; }
@@ -300,6 +234,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   uint32_t get_rx_cmd_count() const { return this->rx_cmd_count_; }
   const std::string &get_last_rx_motor() const { return this->last_rx_motor_; }
   const std::string &get_last_rx_info() const { return this->last_rx_info_; }
+  const std::string &get_last_cmd_info() const { return this->last_cmd_info_; }
   const std::string &get_piggyback_status() const { return this->piggyback_status_; }
 
   void on_cc1101_packet(const std::vector<uint8_t> &data, float rssi);
@@ -367,9 +302,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
  protected:
   cc1101::CC1101Component *radio_{nullptr};
-#ifdef USE_WEBSERVER_BASE
   web_server_base::WebServerBase *web_base_{nullptr};
-#endif
   uint8_t hub_id_[4]{};
   bool hub_id_from_yaml_{false};
   uint8_t seq_{0x80};
@@ -398,29 +331,9 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   std::string pairing_status_{"idle"};
   std::vector<std::string> discovered_ids_;
 
-  // Follow-up retransmission state (TX/RX cycling like Tuya hub).
-  // Each follow-up is rebuilt with a fresh seq so the motor doesn't
-  // deduplicate.  We store the context (motor_id, action, value) to
-  // rebuild packets on each retransmission.
-  uint8_t followup_motor_id_[4]{};
-  uint8_t followup_action_{0};
-  uint8_t followup_value_{0};
-  bool followup_is_command_{false};
-  std::vector<std::vector<uint8_t>> followup_group_pkts_;
-  uint32_t followup_next_ms_{0};
-  int followup_remaining_{0};
-  int followup_total_{0};
-  int followup_group_remaining_{0};
-  static constexpr uint32_t FOLLOWUP_GAP_MS = 200;
-  static constexpr int FOLLOWUP_COUNT_POLL = 6;   // status poll needs many rounds to elicit STATUS
-  static constexpr int FOLLOWUP_COUNT_CMD = 2;    // movement commands: fewer to reduce sibling cross-talk
-
-  // Queued status poll — process one motor at a time with full TX/RX
-  // cycling between each, so motors get proper follow-ups.
-  std::vector<std::string> poll_queue_;
-  uint32_t poll_cooldown_until_{0};
-  static constexpr uint32_t POLL_COOLDOWN_MS = 500;
-
+  // Raw capture for replay testing
+  std::vector<uint8_t> captured_raw_;
+  bool have_capture_{false};
 
   // Diagnostic counters
   uint32_t rx_packet_count_{0};
@@ -429,9 +342,9 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   uint32_t rx_ack_count_{0};
   uint32_t rx_cmd_count_{0};
   uint32_t rx_beacon_count_{0};
-  float last_rssi_{0.0f};
   std::string last_rx_motor_{"none"};
   std::string last_rx_info_{"waiting"};
+  std::string last_cmd_info_{"none"};
   std::string piggyback_status_{"idle"};
 
   static const char *action_name_(uint8_t action) {
@@ -492,28 +405,6 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
            (millis() - this->piggyback_armed_at_ > PIGGYBACK_TIMEOUT_MS);
   }
 
-  // Rebuild follow-up packet with a fresh seq to avoid motor deduplication.
-  std::vector<uint8_t> build_followup_pkt_(uint8_t seq) {
-    if (this->followup_is_command_) {
-      return this->build_command_packet_(this->followup_motor_id_,
-                                          this->followup_action_,
-                                          this->followup_value_, seq);
-    }
-    return build_n4_command(this->hub_id_, this->followup_motor_id_, seq,
-                            this->followup_action_, this->followup_value_,
-                            this->swap_fields_);
-  }
-
-  // Send ACK back to motor after receiving its STATUS report.
-  // The Tuya hub does this; the motor may require it to send further reports.
-  void send_ack_to_motor_(const uint8_t *motor_id, uint8_t seq) {
-    std::vector<uint8_t> pkt = build_ack_packet(
-        this->hub_id_, motor_id, seq, 0x00, this->swap_fields_);
-    ESP_LOGD(TAG, "TX ACK→motor seq=0x%02x motor=%s",
-             seq, format_motor_id(motor_id).c_str());
-    this->transmit_command_only_(pkt, 1);
-  }
-
   // Gap-free long preamble + command using CC1101 async serial mode.
   //
   // The hub's CMT2300A sends 800 bytes (160ms) of continuous 0xAA preamble
@@ -531,16 +422,14 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   void bitbang_tx_(int total) {
     this->radio_->set_crc_enable(false);
     this->radio_->set_whitening(false);
-    // TX at 433.933 MHz during pairing (motor WOR listens here),
-    // 433.950 MHz for normal commands (motor is already awake).
-    float tx_freq = this->scan_active_ ? 433933000.0f : 433950000.0f;
-    this->radio_->set_frequency(tx_freq);
+    this->radio_->set_frequency(433933000.0f);
     this->radio_->set_packet_mode(false);
     this->radio_->begin_tx();
 
     gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
 
-    ESP_LOGD(TAG, "WOR: %d bytes (%dms)", total, total * 8 / 40);
+    ESP_LOGI(TAG, "WOR: %d bytes stream (%dms), async serial",
+             total, total * 8 / 40);
 
     int64_t t0 = esp_timer_get_time();
     int bit_idx = 0;
@@ -574,11 +463,19 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->restore_rx_();
 
     int64_t elapsed_us = esp_timer_get_time() - t0;
-    ESP_LOGD(TAG, "TX done (%lldms) f=%.3fMHz", elapsed_us / 1000, tx_freq / 1e6);
+    ESP_LOGI(TAG, "Async TX complete (%lldms), RX restored at %.3f MHz%s",
+             elapsed_us / 1000,
+             (this->scan_active_ ? 433933000.0f : 433950000.0f) / 1e6,
+             this->scan_active_ ? " [SCAN]" : "");
   }
 
   void transmit_with_preamble_(std::vector<uint8_t> &pkt) {
-    ESP_LOGD(TAG, "TX preamble+cmd (%d bytes)", static_cast<int>(pkt.size()));
+    int pkt_sz = static_cast<int>(pkt.size());
+    char hex[29 * 3 + 1];
+    for (int i = 0; i < pkt_sz && i < 29; i++)
+      snprintf(hex + i * 3, 4, "%02x ", pkt[i]);
+    ESP_LOGI(TAG, "TX async preamble+cmd, frame (%d bytes, CRC=0x%02x): %s",
+             pkt_sz, pkt_sz > 3 ? pkt[pkt_sz - 1] : 0, hex);
 
     static constexpr int PREAMBLE_BYTES = 800;  // 160ms WOR preamble (matches original Tuya hub)
     int cmd_len = static_cast<int>(pkt.size()) - 2;
@@ -596,24 +493,13 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     for (int i = 2; i < static_cast<int>(pkt.size()); i++) this->tx_buf_[p++] = pkt[i];
 
     this->bitbang_tx_(total);
-  }
 
-  // Schedule follow-up retransmissions via loop().  Each follow-up is
-  // rebuilt with a fresh seq so the motor doesn't deduplicate by seq.
-  // is_command=true for movement commands (OPEN/CLOSE/STOP/POS),
-  // false for config/query commands (0x2A, 0x22, etc.)
-  void schedule_followups_(const uint8_t *motor_id, uint8_t action,
-                            uint8_t value, bool is_command = false) {
-    if (this->scan_active_) return;
-    memcpy(this->followup_motor_id_, motor_id, 4);
-    this->followup_action_ = action;
-    this->followup_value_ = value;
-    this->followup_is_command_ = is_command;
-    int count = is_command ? FOLLOWUP_COUNT_CMD : FOLLOWUP_COUNT_POLL;
-    this->followup_remaining_ = count;
-    this->followup_total_ = count;
-    this->followup_next_ms_ = millis() + FOLLOWUP_GAP_MS;
-    ESP_LOGD(TAG, "Scheduled %d follow-ups", count);
+    // Phase 3: retransmissions using packet mode (motor should be awake now).
+    // Skip during pairing scan -- the motor responds immediately and we
+    // need a clean RX window to catch the short response burst.
+    if (!this->scan_active_) {
+      this->transmit_command_only_(pkt, 4);
+    }
   }
 
   // Single preamble followed by multiple command packets, each with its own
@@ -642,20 +528,14 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
       p += GAP_BYTES;  // already 0xAA from memset
     }
 
-    ESP_LOGD(TAG, "GROUP WOR: %d bytes (%dms), %d motors",
+    ESP_LOGI(TAG, "GROUP WOR: %d bytes stream (%dms), %d motors",
              total, total * 8 / 40, static_cast<int>(pkts.size()));
 
     this->bitbang_tx_(total);
 
-    // Schedule follow-ups for all motors in the group.  The first
-    // follow-up fires after FOLLOWUP_GAP_MS; it retransmits all
-    // group commands so each motor gets TX/RX cycling for STATUS.
-    if (!pkts.empty()) {
-      this->followup_group_pkts_ = pkts;
-      this->followup_group_remaining_ = FOLLOWUP_COUNT_CMD;
-      this->followup_next_ms_ = millis() + FOLLOWUP_GAP_MS;
-      ESP_LOGD(TAG, "GROUP: scheduled %d follow-ups for %d motors",
-               FOLLOWUP_COUNT_CMD, static_cast<int>(pkts.size()));
+    // Retransmit each command twice in packet mode (motors are awake)
+    for (auto &pkt : pkts) {
+      this->transmit_command_only_(pkt, 2);
     }
   }
 
@@ -668,7 +548,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->radio_->set_sync1(0x53);
     this->radio_->set_sync0(0x52);
     this->radio_->set_sync_mode(cc1101::SyncMode::SYNC_MODE_16_16);
-    this->radio_->set_frequency(433950000.0f);
+    this->radio_->set_frequency(433933000.0f);
     this->radio_->set_packet_length(static_cast<uint8_t>(pkt.size()));
 
     for (int r = 0; r < retries; r++) {
@@ -709,16 +589,20 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // Build the binary discovery frame (re-built each TX with incrementing seq).
   void build_solicitation_frame_() {
     this->solicit_frame_ = build_discovery_packet(this->hub_id_, this->next_seq());
+    int sz = static_cast<int>(this->solicit_frame_.size());
+    char hex[sz * 3 + 1];
+    for (int i = 0; i < sz; i++) snprintf(hex + i * 3, 4, "%02x ", this->solicit_frame_[i]);
+    ESP_LOGI(TAG, "Discovery frame (%d bytes): %s", sz, hex);
   }
 
   void restore_rx_() {
     this->radio_->set_idle();
     this->radio_->set_crc_enable(false);
     this->radio_->set_whitening(false);
-    // Always use 433.950 MHz for RX — RTL-SDR confirmed motor responds
-    // at ~433.935 MHz regardless of solicitation frequency (within the
-    // 203 kHz RX filter bandwidth centered on 433.950)
-    this->radio_->set_frequency(433950000.0f);
+    // During pairing scan, listen on the TX frequency (433.920 MHz actual)
+    // since the motor responds on the frequency it received on.
+    float rx_freq = this->scan_active_ ? 433933000.0f : 433950000.0f;
+    this->radio_->set_frequency(rx_freq);
     this->radio_->set_sync_mode(cc1101::SyncMode::SYNC_MODE_16_16);
     this->radio_->set_sync1(0xD4);
     this->radio_->set_sync0(0x92);
@@ -726,9 +610,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->radio_->begin_rx();
   }
 
-#ifdef USE_WEBSERVER_BASE
   void setup_web_();  // implemented in sunfree_web.h
-#endif
 };
 
 }  // namespace sunfree_blinds

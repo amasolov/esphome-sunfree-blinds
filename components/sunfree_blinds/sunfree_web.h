@@ -1,7 +1,4 @@
 #pragma once
-#ifndef USE_WEBSERVER_BASE
-// Web UI disabled — web_server_base not available
-#else
 // Included from bottom of sunfree_cover.h — all types must be complete.
 #include "esphome/components/web_server_base/web_server_base.h"
 
@@ -46,7 +43,6 @@ h1{font-size:1.3em;margin-bottom:8px;color:#64b5f6}
 <div class="status" id="pstatus">...</div>
 <div id="discovered"></div>
 </div>
-<div class="hub" id="rxstats" style="font-family:monospace;font-size:.8em"></div>
 <div id="motors"></div>
 <script>
 const B='/sunfree';
@@ -59,9 +55,6 @@ function grpPos(g,el){grp(g,'position',el.value)}
 function render(d){
   document.getElementById('hid').textContent=d.hub_id;
   document.getElementById('pstatus').textContent=d.pairing;
-  if(d.rx){let r=d.rx;document.getElementById('rxstats').innerHTML=
-    'RX: <b>'+r.total+'</b> pkts, valid:'+r.valid+' ack:'+r.ack+' status:'+r.status+' cmd:'+r.cmd+' beacon:'+r.beacon+
-    '<br>Last: '+r.last_motor+' — '+r.last_info;}
   let dd=document.getElementById('discovered');
   if(d.discovered&&d.discovered.length){
     let dh='<div class="disc"><b>Discovered motor IDs</b> (add to YAML):<br>';
@@ -276,19 +269,9 @@ inline std::string SunfreeHub::get_motors_json() {
              c->get_name().c_str(), pair.first.c_str(), c->position, op, bat);
     json += buf;
   }
-  json += "],";
-  char rx_buf[256];
-  snprintf(rx_buf, sizeof(rx_buf),
-           "\"rx\":{\"total\":%u,\"valid\":%u,\"ack\":%u,\"status\":%u,\"cmd\":%u,\"beacon\":%u,\"last_motor\":\"%s\",\"last_info\":\"%s\"}",
-           this->rx_packet_count_, this->rx_valid_count_,
-           this->rx_ack_count_, this->rx_status_count_,
-           this->rx_cmd_count_, this->rx_beacon_count_,
-           this->last_rx_motor_.c_str(), this->last_rx_info_.c_str());
-  json += rx_buf;
-  json += "}";
+  json += "]}";
   return json;
 }
 
 }  // namespace sunfree_blinds
 }  // namespace esphome
-#endif  // USE_WEBSERVER_BASE
