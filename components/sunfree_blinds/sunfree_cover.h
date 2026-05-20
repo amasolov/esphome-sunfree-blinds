@@ -205,16 +205,7 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
   } else if (pkt_len == 16) {
     // Command (overheard from Tuya hub or other device)
     this->rx_cmd_count_++;
-    // Capture raw frame for replay testing
-    this->captured_raw_.assign(data.begin(), data.end());
-    this->have_capture_ = true;
-    // Full hex dump for CRC analysis
-    {
-      char full[29 * 3 + 1];
-      int fn = data.size() < 29 ? data.size() : 29;
-      for (int fi = 0; fi < fn; fi++) snprintf(full + fi * 3, 4, "%02x ", data[fi]);
-      ESP_LOGI(TAG, "CAPTURED CMD full (%d bytes): %s", fn, full);
-    }
+    ESP_LOGD(TAG, "RX CMD frame (%d bytes)", static_cast<int>(data.size()));
     SunfreePacket pkt{};
     if (parse_command(data.data(), data.size(), pkt) && pkt.valid) {
       std::string mid = format_motor_id(pkt.motor_id);
@@ -225,7 +216,6 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
                hid.c_str(), mid.c_str(), static_cast<int>(pkt.action),
                pkt.value, pkt.seq);
       this->last_rx_info_ = buf;
-      this->last_cmd_info_ = buf;
       this->set_overheard_seq(pkt.seq);
     } else {
       uint8_t extracted[16];
