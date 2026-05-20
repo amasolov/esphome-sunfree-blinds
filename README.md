@@ -315,13 +315,6 @@ psram:
 > `esphome compile` after deleting the build directory to ensure PSRAM
 > is enabled.
 
-## Web UI (optional)
-
-When `web_server` is enabled in your YAML, the component serves a control
-page at `http://<device-ip>/sunfree` with motor status, buttons, and
-configuration commands. The web UI is optional and automatically disabled
-when `web_server` is not configured.
-
 ## How it works
 
 The component implements the full Sunfree/Tuya 433 MHz protocol:
