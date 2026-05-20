@@ -191,6 +191,12 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
  protected:
   void on_send_config_(std::string motor_id, std::string action_type) {
+    // "request_status" with "all" queues STOP poll for every motor
+    if (action_type == "request_status" && motor_id == "all") {
+      this->on_request_status_all_();
+      return;
+    }
+
     uint8_t mid[4];
     if (motor_id.length() != 8) {
       ESP_LOGW(TAG, "send_config: motor_id must be 8 hex chars, got '%s'", motor_id.c_str());
@@ -230,25 +236,14 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->send_config(mid, action, value);
   }
 
-  void on_request_status_(std::string motor_id) {
-    if (motor_id == "all") {
-      this->poll_queue_.clear();
-      this->poll_cooldown_until_ = 0;
-      for (auto &kv : this->covers_) {
-        this->poll_queue_.push_back(kv.first);
-      }
-      ESP_LOGI(TAG, "Queued STOP poll for %d motors",
-               static_cast<int>(this->poll_queue_.size()));
-      return;
+  void on_request_status_all_() {
+    this->poll_queue_.clear();
+    this->poll_cooldown_until_ = 0;
+    for (auto &kv : this->covers_) {
+      this->poll_queue_.push_back(kv.first);
     }
-    uint8_t mid[4];
-    if (motor_id.length() != 8) {
-      ESP_LOGW(TAG, "request_status: motor_id must be 8 hex chars or 'all', got '%s'",
-               motor_id.c_str());
-      return;
-    }
-    parse_motor_id(motor_id, mid);
-    this->request_status(mid);
+    ESP_LOGI(TAG, "Queued STOP poll for %d motors",
+             static_cast<int>(this->poll_queue_.size()));
   }
 
   void on_group_command_(std::string group, std::string action_str) {
