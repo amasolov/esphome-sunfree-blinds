@@ -53,9 +53,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
                      {"motor_id", "action_type"});
     register_service(&SunfreeHub::on_group_command_, "group_command",
                      {"group", "action"});
-    register_service(&SunfreeHub::on_request_status_, "request_status",
-                     {"motor_id"});
-    ESP_LOGI(TAG, "Registered services: send_config, group_command, request_status");
+    ESP_LOGI(TAG, "Registered services: send_config, group_command");
 
     if (this->web_base_) this->setup_web_();
   }
