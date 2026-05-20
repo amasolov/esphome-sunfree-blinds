@@ -16,8 +16,9 @@ class SunfreeCover : public cover::Cover, public Component {
     parse_motor_id(id, this->motor_id_);
     this->motor_id_str_ = id;
   }
+  void set_invert_position(bool invert) { this->invert_position_ = invert; }
   void set_battery_sensor(sensor::Sensor *sensor) { this->battery_sensor_ = sensor; }
-  void set_signal_sensor(sensor::Sensor *sensor) { this->signal_sensor_ = sensor; }
+  bool get_invert_position() const { return this->invert_position_; }
 
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI - 1; }
 
@@ -44,8 +45,15 @@ class SunfreeCover : public cover::Cover, public Component {
     if (call.get_position().has_value()) {
       float target = *call.get_position();
       float prev = this->position;
-      // HA: 0.0=closed, 1.0=open.  Motor: 0=open, 100=closed.
-      uint8_t motor_pos = static_cast<uint8_t>((1.0f - target) * 100.0f);
+      // HA: 0.0=closed, 1.0=open.
+      // Standard motor: 0=open, 100=closed.
+      // Inverted motor: 0=closed, 100=open.
+      uint8_t motor_pos;
+      if (this->invert_position_) {
+        motor_pos = static_cast<uint8_t>(target * 100.0f);
+      } else {
+        motor_pos = static_cast<uint8_t>((1.0f - target) * 100.0f);
+      }
       if (motor_pos == 0) {
         this->hub_->send_command(this->motor_id_, ACTION_OPEN);
       } else if (motor_pos >= 100) {
@@ -72,8 +80,13 @@ class SunfreeCover : public cover::Cover, public Component {
     }
   }
 
-  void on_status(uint8_t state, uint8_t motor_position, uint8_t battery, float rssi = 0.0f) {
-    float ha_pos = (100.0f - motor_position) / 100.0f;
+  void on_status(uint8_t state, uint8_t motor_position, uint8_t battery) {
+    float ha_pos;
+    if (this->invert_position_) {
+      ha_pos = motor_position / 100.0f;
+    } else {
+      ha_pos = (100.0f - motor_position) / 100.0f;
+    }
     this->position = ha_pos;
 
     switch (state) {
@@ -92,21 +105,18 @@ class SunfreeCover : public cover::Cover, public Component {
     if (this->battery_sensor_ != nullptr) {
       this->battery_sensor_->publish_state(battery);
     }
-    if (this->signal_sensor_ != nullptr) {
-      this->signal_sensor_->publish_state(rssi);
-    }
 
-    ESP_LOGI("sunfree", "Status %s: state=%d pos=%d(%d%%) bat=%d%% rssi=%.0f",
+    ESP_LOGD("sunfree", "Status %s: state=%d pos=%d(%d%%) bat=%d%%",
              this->motor_id_str_.c_str(), state, motor_position,
-             static_cast<int>(ha_pos * 100), battery, rssi);
+             static_cast<int>(ha_pos * 100), battery);
   }
 
  protected:
   SunfreeHub *hub_{nullptr};
   uint8_t motor_id_[4]{};
   std::string motor_id_str_;
+  bool invert_position_{false};
   sensor::Sensor *battery_sensor_{nullptr};
-  sensor::Sensor *signal_sensor_{nullptr};
 };
 
 // Implementation of hub method that depends on SunfreeCover
@@ -116,7 +126,6 @@ inline void SunfreeHub::register_cover(SunfreeCover *cover) {
 
 inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float rssi) {
   this->rx_packet_count_++;
-  this->last_rssi_ = rssi;
 
   // Expire stale piggyback
   if (this->piggyback_expired_()) {
@@ -127,8 +136,19 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
 
   // Scan timeout is now handled in loop()
 
-  ESP_LOGD(TAG, "RX #%u (%d bytes, rssi=%.0f)",
-           this->rx_packet_count_, data.size(), rssi);
+  int n = data.size() < 29 ? data.size() : 29;
+  char hex[29 * 3 + 1];
+  for (int i = 0; i < n; i++) snprintf(hex + i * 3, 4, "%02x ", data[i]);
+
+  // During scan, log ALL strong packets at INFO level to detect motor responses
+  // even if the first byte isn't 0x91 (could indicate frequency/sync issues)
+  if (this->scan_active_ && rssi > -90.0f) {
+    ESP_LOGW(TAG, "SCAN STRONG RX #%u (%d bytes, rssi=%.0f): %s",
+             this->rx_packet_count_, data.size(), rssi, hex);
+  } else {
+    ESP_LOGD(TAG, "RX #%u raw (%d bytes, rssi=%.0f): %s",
+             this->rx_packet_count_, data.size(), rssi, hex);
+  }
 
   if (data.size() < 2 || data[0] != 0x91) return;
 
@@ -179,13 +199,22 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
                          this->piggyback_position_);
       }
     } else {
-      ESP_LOGW(TAG, "ACK parse_fail rssi=%.0f", rssi);
       this->last_rx_info_ = "ACK parse_fail";
     }
 
   } else if (pkt_len == 16) {
     // Command (overheard from Tuya hub or other device)
     this->rx_cmd_count_++;
+    // Capture raw frame for replay testing
+    this->captured_raw_.assign(data.begin(), data.end());
+    this->have_capture_ = true;
+    // Full hex dump for CRC analysis
+    {
+      char full[29 * 3 + 1];
+      int fn = data.size() < 29 ? data.size() : 29;
+      for (int fi = 0; fi < fn; fi++) snprintf(full + fi * 3, 4, "%02x ", data[fi]);
+      ESP_LOGI(TAG, "CAPTURED CMD full (%d bytes): %s", fn, full);
+    }
     SunfreePacket pkt{};
     if (parse_command(data.data(), data.size(), pkt) && pkt.valid) {
       std::string mid = format_motor_id(pkt.motor_id);
@@ -196,6 +225,7 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
                hid.c_str(), mid.c_str(), static_cast<int>(pkt.action),
                pkt.value, pkt.seq);
       this->last_rx_info_ = buf;
+      this->last_cmd_info_ = buf;
       this->set_overheard_seq(pkt.seq);
     } else {
       uint8_t extracted[16];
@@ -213,29 +243,44 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
 
       if (!is_beacon) is_beacon = (d4[14] == 0xEE);
 
+      char hx[16 * 3 + 1];
+      for (int i = 0; i < 16; i++) snprintf(hx + i * 3, 4, "%02x ", d4[i]);
+
       if (is_beacon) {
         this->rx_beacon_count_++;
         this->rx_cmd_count_--;
 
-        // n=3 decrypt for proper address extraction (bytes 3-6)
+        char raw_hx[16 * 3 + 1];
+        for (int i = 0; i < 16; i++) snprintf(raw_hx + i * 3, 4, "%02x ", extracted[i]);
+        ESP_LOGI(TAG, "PAIRING BEACON: raw=%s dec4=%s rssi=%.0f", raw_hx, hx, rssi);
+        ESP_LOGI(TAG, "BEACON raw[14]=0x%02x dec4[14]=0x%02x", extracted[14], d4[14]);
+
+        // Also try n=3 decrypt (first 12 bytes only) for proper address extraction
         uint8_t d3[16];
         memcpy(d3, extracted, 16);
         uint32_t w3[3];
         memcpy(w3, d3, 12);
         xxtea_decrypt(w3, 3, SUNFREE_KEY);
-        memcpy(d3, w3, 12);
+        memcpy(d3, w3, 12);  // bytes 12-15 stay as cleartext
+        char d3_hx[16 * 3 + 1];
+        for (int i = 0; i < 16; i++) snprintf(d3_hx + i * 3, 4, "%02x ", d3[i]);
+        ESP_LOGI(TAG, "BEACON dec3=%s", d3_hx);
 
-        ESP_LOGI(TAG, "BEACON rssi=%.0f", rssi);
-        this->last_rx_info_ = "BEACON";
+        char buf[120];
+        snprintf(buf, sizeof(buf), "BEACON raw14=0x%02x dec4=%s", extracted[14], hx);
+        this->last_rx_info_ = buf;
 
         if (this->scan_active_) {
           this->pairing_status_ = "BEACON FOUND";
           ESP_LOGI(TAG, "PAIRING: beacon found! Sending response...");
+          // Try n=3 decrypted data for address (bytes 3-6)
           this->send_pairing_response(d3);
         }
       } else {
-        ESP_LOGW(TAG, "CMD parse_fail rssi=%.0f", rssi);
-        this->last_rx_info_ = "CMD parse_fail";
+        ESP_LOGW(TAG, "CMD parse_fail dec4: %s rssi=%.0f", hx, rssi);
+        char buf[120];
+        snprintf(buf, sizeof(buf), "CMD fail dec=%s", hx);
+        this->last_rx_info_ = buf;
       }
     }
 
@@ -258,14 +303,10 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
 
       auto it = this->covers_.find(mid);
       if (it != this->covers_.end()) {
-        it->second->on_status(resp.state, resp.position, resp.battery, rssi);
+        it->second->on_status(resp.state, resp.position, resp.battery);
       } else {
         ESP_LOGW(TAG, "Status from unknown motor %s", mid.c_str());
       }
-
-      // ACK back to the motor — the Tuya hub always does this after STATUS;
-      // the motor may require it before sending further reports.
-      this->send_ack_to_motor_(resp.motor_id, resp.seq);
 
       // Auto-piggyback: fire queued command when target motor sends status report.
       // Verify hub_id to ensure this is a genuine motor→hub report.
@@ -284,20 +325,10 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
     } else {
       uint8_t extracted[24];
       d492_extract_payload(data.data(), data.size(), extracted, 24);
-      uint32_t words6[6];
-      memcpy(words6, extracted, 24);
-      xxtea_decrypt(words6, 6, SUNFREE_KEY);
-      uint8_t dec6[24];
-      memcpy(dec6, words6, 24);
-
-      ESP_LOGW(TAG, "STATUS parse_fail: dec[0]=0x%02x hub=%02x%02x%02x%02x motor=%02x%02x%02x%02x",
-               dec6[0], dec6[3], dec6[4], dec6[5], dec6[6],
-               dec6[7], dec6[8], dec6[9], dec6[10]);
-
-      char buf[80];
-      snprintf(buf, sizeof(buf), "STATUS fail 0x%02x h=%02x%02x%02x%02x m=%02x%02x%02x%02x",
-               dec6[0], dec6[3], dec6[4], dec6[5], dec6[6],
-               dec6[7], dec6[8], dec6[9], dec6[10]);
+      char hx[24 * 3 + 1];
+      for (int i = 0; i < 24; i++) snprintf(hx + i * 3, 4, "%02x ", extracted[i]);
+      char buf[120];
+      snprintf(buf, sizeof(buf), "STATUS parse_fail raw=%s", hx);
       this->last_rx_info_ = buf;
     }
 
@@ -367,21 +398,35 @@ inline void SunfreeHub::send_group_command(const std::string &group,
   std::vector<std::vector<uint8_t>> pkts;
   for (auto *c : targets) {
     uint8_t seq = this->next_seq();
-    pkts.push_back(this->build_command_packet_(c->get_motor_id(), action, position, seq));
-    ESP_LOGI(TAG, "GROUP[%s] TX %s seq=0x%02x motor=%s",
-             group.empty() ? "all" : group.c_str(), action_name_(action),
-             seq, c->get_motor_id_str().c_str());
+    uint8_t eff_action = action;
+    uint8_t eff_position = position;
+    if (c->get_invert_position() && action != ACTION_STOP) {
+      if (action == ACTION_OPEN) eff_action = ACTION_CLOSE;
+      else if (action == ACTION_CLOSE) eff_action = ACTION_OPEN;
+      else if (action == ACTION_POSITION) eff_position = 100 - position;
+    }
+    pkts.push_back(this->build_command_packet_(c->get_motor_id(), eff_action, eff_position, seq));
+    ESP_LOGI(TAG, "GROUP[%s] TX %s seq=0x%02x motor=%s%s",
+             group.empty() ? "all" : group.c_str(), action_name_(eff_action),
+             seq, c->get_motor_id_str().c_str(),
+             c->get_invert_position() ? " (inverted)" : "");
   }
   this->transmit_group_with_preamble_(pkts);
 
-  float target_pos = -1;
-  if (action == ACTION_OPEN) target_pos = 1.0f;
-  else if (action == ACTION_CLOSE) target_pos = 0.0f;
-  else if (action == ACTION_POSITION) target_pos = 1.0f - (position / 100.0f);
   for (auto *c : targets) {
     if (action == ACTION_STOP) {
       c->current_operation = cover::COVER_OPERATION_IDLE;
-    } else if (target_pos >= 0) {
+    } else {
+      float target_pos;
+      if (c->get_invert_position()) {
+        if (action == ACTION_OPEN) target_pos = 0.0f;
+        else if (action == ACTION_CLOSE) target_pos = 1.0f;
+        else target_pos = position / 100.0f;
+      } else {
+        if (action == ACTION_OPEN) target_pos = 1.0f;
+        else if (action == ACTION_CLOSE) target_pos = 0.0f;
+        else target_pos = 1.0f - (position / 100.0f);
+      }
       float prev = c->position;
       c->position = target_pos;
       c->current_operation = (target_pos > prev)
@@ -395,7 +440,5 @@ inline void SunfreeHub::send_group_command(const std::string &group,
 }  // namespace sunfree_blinds
 }  // namespace esphome
 
-#ifdef USE_WEBSERVER_BASE
 // Web UI — must come after SunfreeHub and SunfreeCover are fully defined
 #include "sunfree_web.h"
-#endif
