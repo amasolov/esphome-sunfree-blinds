@@ -3,7 +3,9 @@
 #include "esphome/core/log.h"
 #include "esphome/core/preferences.h"
 #include "esphome/components/api/custom_api_device.h"
+#ifdef USE_WEBSERVER_BASE
 #include "esphome/components/web_server_base/web_server_base.h"
+#endif
 #include "esphome/components/cc1101/cc1101.h"
 #include "sunfree_protocol.h"
 #include <map>
@@ -32,7 +34,9 @@ class SunfreeCover;
 class SunfreeHub : public Component, public api::CustomAPIDevice {
  public:
   void set_cc1101(cc1101::CC1101Component *radio) { this->radio_ = radio; }
+#ifdef USE_WEBSERVER_BASE
   void set_web_base(web_server_base::WebServerBase *base) { this->web_base_ = base; }
+#endif
   void set_hub_id(const std::string &id) {
     parse_motor_id(id, this->hub_id_);
     this->hub_id_from_yaml_ = true;
@@ -55,7 +59,9 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
                      {"group", "action"});
     ESP_LOGI(TAG, "Registered services: send_config, group_command");
 
+#ifdef USE_WEBSERVER_BASE
     if (this->web_base_) this->setup_web_();
+#endif
   }
 
   void loop() override {
@@ -283,7 +289,9 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   }
 
   std::string get_hub_id_str() const { return format_motor_id(this->hub_id_); }
+#ifdef USE_WEBSERVER_BASE
   std::string get_motors_json();  // implemented in sunfree_web.h
+#endif
 
   uint32_t get_rx_packet_count() const { return this->rx_packet_count_; }
   uint32_t get_rx_valid_count() const { return this->rx_valid_count_; }
@@ -359,7 +367,9 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
  protected:
   cc1101::CC1101Component *radio_{nullptr};
+#ifdef USE_WEBSERVER_BASE
   web_server_base::WebServerBase *web_base_{nullptr};
+#endif
   uint8_t hub_id_[4]{};
   bool hub_id_from_yaml_{false};
   uint8_t seq_{0x80};
@@ -716,7 +726,9 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->radio_->begin_rx();
   }
 
+#ifdef USE_WEBSERVER_BASE
   void setup_web_();  // implemented in sunfree_web.h
+#endif
 };
 
 }  // namespace sunfree_blinds
