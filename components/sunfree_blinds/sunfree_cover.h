@@ -127,14 +127,8 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
 
   // Scan timeout is now handled in loop()
 
-  int n = data.size() < 29 ? data.size() : 29;
-  char hex[29 * 3 + 1];
-  for (int i = 0; i < n; i++) snprintf(hex + i * 3, 4, "%02x ", data[i]);
-
-  // During scan, log ALL strong packets at INFO level to detect motor responses
-  // even if the first byte isn't 0x91 (could indicate frequency/sync issues)
-  ESP_LOGI(TAG, "RX #%u raw (%d bytes, rssi=%.0f): %s",
-           this->rx_packet_count_, data.size(), rssi, hex);
+  ESP_LOGD(TAG, "RX #%u (%d bytes, rssi=%.0f)",
+           this->rx_packet_count_, data.size(), rssi);
 
   if (data.size() < 2 || data[0] != 0x91) return;
 
@@ -185,36 +179,13 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
                          this->piggyback_position_);
       }
     } else {
-      uint8_t extracted[12];
-      d492_extract_payload(data.data(), data.size(), extracted, 12);
-      uint32_t w3[3];
-      memcpy(w3, extracted, 12);
-      xxtea_decrypt(w3, 3, SUNFREE_KEY);
-      uint8_t d3[12];
-      memcpy(d3, w3, 12);
-      ESP_LOGW(TAG, "ACK parse_fail: dec[0]=0x%02x hub=%02x%02x%02x%02x motor=%02x%02x%02x%02x flags=0x%02x",
-               d3[0], d3[3], d3[4], d3[5], d3[6],
-               d3[7], d3[8], d3[9], d3[10], d3[11]);
-      char buf[120];
-      snprintf(buf, sizeof(buf), "ACK parse_fail dec[0]=0x%02x hub=%02x%02x%02x%02x motor=%02x%02x%02x%02x",
-               d3[0], d3[3], d3[4], d3[5], d3[6],
-               d3[7], d3[8], d3[9], d3[10]);
-      this->last_rx_info_ = buf;
+      ESP_LOGW(TAG, "ACK parse_fail rssi=%.0f", rssi);
+      this->last_rx_info_ = "ACK parse_fail";
     }
 
   } else if (pkt_len == 16) {
     // Command (overheard from Tuya hub or other device)
     this->rx_cmd_count_++;
-    // Capture raw frame for replay testing
-    this->captured_raw_.assign(data.begin(), data.end());
-    this->have_capture_ = true;
-    // Full hex dump for CRC analysis
-    {
-      char full[29 * 3 + 1];
-      int fn = data.size() < 29 ? data.size() : 29;
-      for (int fi = 0; fi < fn; fi++) snprintf(full + fi * 3, 4, "%02x ", data[fi]);
-      ESP_LOGI(TAG, "CAPTURED CMD full (%d bytes): %s", fn, full);
-    }
     SunfreePacket pkt{};
     if (parse_command(data.data(), data.size(), pkt) && pkt.valid) {
       std::string mid = format_motor_id(pkt.motor_id);
@@ -225,7 +196,6 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
                hid.c_str(), mid.c_str(), static_cast<int>(pkt.action),
                pkt.value, pkt.seq);
       this->last_rx_info_ = buf;
-      this->last_cmd_info_ = buf;
       this->set_overheard_seq(pkt.seq);
     } else {
       uint8_t extracted[16];
@@ -243,44 +213,29 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
 
       if (!is_beacon) is_beacon = (d4[14] == 0xEE);
 
-      char hx[16 * 3 + 1];
-      for (int i = 0; i < 16; i++) snprintf(hx + i * 3, 4, "%02x ", d4[i]);
-
       if (is_beacon) {
         this->rx_beacon_count_++;
         this->rx_cmd_count_--;
 
-        char raw_hx[16 * 3 + 1];
-        for (int i = 0; i < 16; i++) snprintf(raw_hx + i * 3, 4, "%02x ", extracted[i]);
-        ESP_LOGI(TAG, "PAIRING BEACON: raw=%s dec4=%s rssi=%.0f", raw_hx, hx, rssi);
-        ESP_LOGI(TAG, "BEACON raw[14]=0x%02x dec4[14]=0x%02x", extracted[14], d4[14]);
-
-        // Also try n=3 decrypt (first 12 bytes only) for proper address extraction
+        // n=3 decrypt for proper address extraction (bytes 3-6)
         uint8_t d3[16];
         memcpy(d3, extracted, 16);
         uint32_t w3[3];
         memcpy(w3, d3, 12);
         xxtea_decrypt(w3, 3, SUNFREE_KEY);
-        memcpy(d3, w3, 12);  // bytes 12-15 stay as cleartext
-        char d3_hx[16 * 3 + 1];
-        for (int i = 0; i < 16; i++) snprintf(d3_hx + i * 3, 4, "%02x ", d3[i]);
-        ESP_LOGI(TAG, "BEACON dec3=%s", d3_hx);
+        memcpy(d3, w3, 12);
 
-        char buf[120];
-        snprintf(buf, sizeof(buf), "BEACON raw14=0x%02x dec4=%s", extracted[14], hx);
-        this->last_rx_info_ = buf;
+        ESP_LOGI(TAG, "BEACON rssi=%.0f", rssi);
+        this->last_rx_info_ = "BEACON";
 
         if (this->scan_active_) {
           this->pairing_status_ = "BEACON FOUND";
           ESP_LOGI(TAG, "PAIRING: beacon found! Sending response...");
-          // Try n=3 decrypted data for address (bytes 3-6)
           this->send_pairing_response(d3);
         }
       } else {
-        ESP_LOGW(TAG, "CMD parse_fail dec4: %s rssi=%.0f", hx, rssi);
-        char buf[120];
-        snprintf(buf, sizeof(buf), "CMD fail dec=%s", hx);
-        this->last_rx_info_ = buf;
+        ESP_LOGW(TAG, "CMD parse_fail rssi=%.0f", rssi);
+        this->last_rx_info_ = "CMD parse_fail";
       }
     }
 
@@ -329,27 +284,18 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
     } else {
       uint8_t extracted[24];
       d492_extract_payload(data.data(), data.size(), extracted, 24);
-
-      // Decrypt and dump both raw and decrypted for diagnostics
       uint32_t words6[6];
       memcpy(words6, extracted, 24);
       xxtea_decrypt(words6, 6, SUNFREE_KEY);
       uint8_t dec6[24];
       memcpy(dec6, words6, 24);
 
-      char hx[24 * 3 + 1];
-      for (int i = 0; i < 24; i++) snprintf(hx + i * 3, 4, "%02x ", extracted[i]);
-      char dx[24 * 3 + 1];
-      for (int i = 0; i < 24; i++) snprintf(dx + i * 3, 4, "%02x ", dec6[i]);
-
-      ESP_LOGW(TAG, "STATUS parse_fail: raw=%s", hx);
-      ESP_LOGW(TAG, "STATUS parse_fail: dec=%s", dx);
-      ESP_LOGW(TAG, "STATUS parse_fail: dec[0]=0x%02x (need 0x0B) hub=%02x%02x%02x%02x motor=%02x%02x%02x%02x",
+      ESP_LOGW(TAG, "STATUS parse_fail: dec[0]=0x%02x hub=%02x%02x%02x%02x motor=%02x%02x%02x%02x",
                dec6[0], dec6[3], dec6[4], dec6[5], dec6[6],
                dec6[7], dec6[8], dec6[9], dec6[10]);
 
-      char buf[180];
-      snprintf(buf, sizeof(buf), "STATUS parse_fail dec[0]=0x%02x hub=%02x%02x%02x%02x motor=%02x%02x%02x%02x",
+      char buf[80];
+      snprintf(buf, sizeof(buf), "STATUS fail 0x%02x h=%02x%02x%02x%02x m=%02x%02x%02x%02x",
                dec6[0], dec6[3], dec6[4], dec6[5], dec6[6],
                dec6[7], dec6[8], dec6[9], dec6[10]);
       this->last_rx_info_ = buf;

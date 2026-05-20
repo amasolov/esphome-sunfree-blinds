@@ -69,7 +69,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
       int idx = this->followup_total_ - this->followup_remaining_;
       uint8_t seq = this->next_seq();
       auto pkt = this->build_followup_pkt_(seq);
-      ESP_LOGI(TAG, "Follow-up TX %d/%d seq=0x%02x", idx + 1, this->followup_total_, seq);
+      ESP_LOGD(TAG, "Follow-up TX %d/%d seq=0x%02x", idx + 1, this->followup_total_, seq);
       this->transmit_command_only_(pkt, 1);
       this->followup_remaining_--;
       if (this->followup_remaining_ > 0) {
@@ -96,7 +96,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     // Group follow-ups: retransmit all group commands per round
     if (this->followup_group_remaining_ > 0 && this->followup_remaining_ <= 0 &&
         now >= this->followup_next_ms_) {
-      ESP_LOGI(TAG, "Group follow-up %d/%d (%d motors)",
+      ESP_LOGD(TAG, "Group follow-up %d/%d (%d motors)",
                FOLLOWUP_COUNT - this->followup_group_remaining_ + 1,
                FOLLOWUP_COUNT,
                static_cast<int>(this->followup_group_pkts_.size()));
@@ -277,32 +277,6 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->transmit_command_only_(pkt, 3);
   }
 
-  // Replay: retransmit a captured hub CMD packet on the TX path
-  // This tests whether our RF parameters can deliver a known-good packet.
-  // The captured D492 RX frame must be bit-shifted back to CMT2300A framing.
-  void replay_captured() {
-    if (!this->have_capture_) {
-      ESP_LOGW(TAG, "Replay: no capture available");
-      this->piggyback_status_ = "REPLAY: no capture";
-      return;
-    }
-    // Extract the CMT2300A payload (16 bytes) from the D492 RX frame
-    uint8_t payload[16];
-    if (!d492_extract_payload(this->captured_raw_.data(), this->captured_raw_.size(), payload, 16)) {
-      ESP_LOGW(TAG, "Replay: extraction failed");
-      this->piggyback_status_ = "REPLAY: extract fail";
-      return;
-    }
-    // Build a TX frame from the extracted payload (includes CRC-8)
-    std::vector<uint8_t> frame = build_tx_frame(payload, 16);
-    char hex[30 * 3 + 1];
-    for (int i = 0; i < static_cast<int>(frame.size()); i++) snprintf(hex + i * 3, 4, "%02x ", frame[i]);
-    ESP_LOGI(TAG, "REPLAY TX frame: %s", hex);
-    this->piggyback_status_ = "REPLAYING...";
-    this->transmit_with_preamble_(frame);
-    this->piggyback_status_ = "REPLAYED";
-  }
-
   std::string get_hub_id_str() const { return format_motor_id(this->hub_id_); }
   std::string get_motors_json();  // implemented in sunfree_web.h
 
@@ -313,7 +287,6 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   uint32_t get_rx_cmd_count() const { return this->rx_cmd_count_; }
   const std::string &get_last_rx_motor() const { return this->last_rx_motor_; }
   const std::string &get_last_rx_info() const { return this->last_rx_info_; }
-  const std::string &get_last_cmd_info() const { return this->last_cmd_info_; }
   const std::string &get_piggyback_status() const { return this->piggyback_status_; }
 
   void on_cc1101_packet(const std::vector<uint8_t> &data, float rssi);
@@ -432,9 +405,6 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   uint32_t poll_cooldown_until_{0};
   static constexpr uint32_t POLL_COOLDOWN_MS = 500;
 
-  // Raw capture for replay testing
-  std::vector<uint8_t> captured_raw_;
-  bool have_capture_{false};
 
   // Diagnostic counters
   uint32_t rx_packet_count_{0};
@@ -446,7 +416,6 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   float last_rssi_{0.0f};
   std::string last_rx_motor_{"none"};
   std::string last_rx_info_{"waiting"};
-  std::string last_cmd_info_{"none"};
   std::string piggyback_status_{"idle"};
 
   static const char *action_name_(uint8_t action) {
@@ -524,7 +493,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   void send_ack_to_motor_(const uint8_t *motor_id, uint8_t seq) {
     std::vector<uint8_t> pkt = build_ack_packet(
         this->hub_id_, motor_id, seq, 0x00, this->swap_fields_);
-    ESP_LOGI(TAG, "TX ACK→motor seq=0x%02x motor=%s",
+    ESP_LOGD(TAG, "TX ACK→motor seq=0x%02x motor=%s",
              seq, format_motor_id(motor_id).c_str());
     this->transmit_command_only_(pkt, 1);
   }
@@ -555,8 +524,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
     gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
 
-    ESP_LOGI(TAG, "WOR: %d bytes stream (%dms), async serial",
-             total, total * 8 / 40);
+    ESP_LOGD(TAG, "WOR: %d bytes (%dms)", total, total * 8 / 40);
 
     int64_t t0 = esp_timer_get_time();
     int bit_idx = 0;
@@ -590,18 +558,11 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->restore_rx_();
 
     int64_t elapsed_us = esp_timer_get_time() - t0;
-    ESP_LOGI(TAG, "Async TX complete (%lldms) TX=%.3f RX=433.950 MHz%s",
-             elapsed_us / 1000, tx_freq / 1e6,
-             this->scan_active_ ? " [SCAN]" : "");
+    ESP_LOGD(TAG, "TX done (%lldms) f=%.3fMHz", elapsed_us / 1000, tx_freq / 1e6);
   }
 
   void transmit_with_preamble_(std::vector<uint8_t> &pkt) {
-    int pkt_sz = static_cast<int>(pkt.size());
-    char hex[29 * 3 + 1];
-    for (int i = 0; i < pkt_sz && i < 29; i++)
-      snprintf(hex + i * 3, 4, "%02x ", pkt[i]);
-    ESP_LOGI(TAG, "TX async preamble+cmd, frame (%d bytes, CRC=0x%02x): %s",
-             pkt_sz, pkt_sz > 3 ? pkt[pkt_sz - 1] : 0, hex);
+    ESP_LOGD(TAG, "TX preamble+cmd (%d bytes)", static_cast<int>(pkt.size()));
 
     static constexpr int PREAMBLE_BYTES = 800;  // 160ms WOR preamble (matches original Tuya hub)
     int cmd_len = static_cast<int>(pkt.size()) - 2;
@@ -635,8 +596,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->followup_remaining_ = FOLLOWUP_COUNT;
     this->followup_total_ = FOLLOWUP_COUNT;
     this->followup_next_ms_ = millis() + FOLLOWUP_GAP_MS;
-    ESP_LOGI(TAG, "Scheduled %d follow-ups, first in %dms",
-             FOLLOWUP_COUNT, FOLLOWUP_GAP_MS);
+    ESP_LOGD(TAG, "Scheduled %d follow-ups", FOLLOWUP_COUNT);
   }
 
   // Single preamble followed by multiple command packets, each with its own
@@ -665,7 +625,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
       p += GAP_BYTES;  // already 0xAA from memset
     }
 
-    ESP_LOGI(TAG, "GROUP WOR: %d bytes stream (%dms), %d motors",
+    ESP_LOGD(TAG, "GROUP WOR: %d bytes (%dms), %d motors",
              total, total * 8 / 40, static_cast<int>(pkts.size()));
 
     this->bitbang_tx_(total);
@@ -677,7 +637,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
       this->followup_group_pkts_ = pkts;
       this->followup_group_remaining_ = FOLLOWUP_COUNT;
       this->followup_next_ms_ = millis() + FOLLOWUP_GAP_MS;
-      ESP_LOGI(TAG, "GROUP: scheduled %d follow-ups for %d motors",
+      ESP_LOGD(TAG, "GROUP: scheduled %d follow-ups for %d motors",
                FOLLOWUP_COUNT, static_cast<int>(pkts.size()));
     }
   }
@@ -732,10 +692,6 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // Build the binary discovery frame (re-built each TX with incrementing seq).
   void build_solicitation_frame_() {
     this->solicit_frame_ = build_discovery_packet(this->hub_id_, this->next_seq());
-    int sz = static_cast<int>(this->solicit_frame_.size());
-    char hex[sz * 3 + 1];
-    for (int i = 0; i < sz; i++) snprintf(hex + i * 3, 4, "%02x ", this->solicit_frame_[i]);
-    ESP_LOGI(TAG, "Discovery frame (%d bytes): %s", sz, hex);
   }
 
   void restore_rx_() {
