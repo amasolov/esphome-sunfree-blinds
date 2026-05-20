@@ -97,8 +97,8 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     if (this->followup_group_remaining_ > 0 && this->followup_remaining_ <= 0 &&
         now >= this->followup_next_ms_) {
       ESP_LOGD(TAG, "Group follow-up %d/%d (%d motors)",
-               FOLLOWUP_COUNT - this->followup_group_remaining_ + 1,
-               FOLLOWUP_COUNT,
+               FOLLOWUP_COUNT_CMD - this->followup_group_remaining_ + 1,
+               FOLLOWUP_COUNT_CMD,
                static_cast<int>(this->followup_group_pkts_.size()));
       for (auto &pkt : this->followup_group_pkts_) {
         this->transmit_command_only_(pkt, 1);
@@ -182,9 +182,14 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // Poll a motor for status (battery + position).
   // Sends a STOP command — harmless if motor is already stopped, but
   // triggers the full TX/RX cycling that elicits STATUS reports.
-  // (0x2A STATUS_QUERY only gets ACKs; STOP triggers actual STATUS.)
+  // Uses FOLLOWUP_COUNT_POLL (6) instead of FOLLOWUP_COUNT_CMD (2).
   void request_status(const uint8_t *motor_id) {
-    this->send_command(motor_id, ACTION_STOP);
+    uint8_t seq = this->next_seq();
+    auto pkt = this->build_command_packet_(motor_id, ACTION_STOP, 0, seq);
+    ESP_LOGI(TAG, "TX POLL (STOP) seq=0x%02x motor=%s", seq,
+             format_motor_id(motor_id).c_str());
+    this->transmit_with_preamble_(pkt);
+    this->schedule_followups_(motor_id, ACTION_STOP, 0, false);
   }
 
   float get_last_rssi() const { return this->last_rssi_; }
@@ -397,7 +402,8 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   int followup_total_{0};
   int followup_group_remaining_{0};
   static constexpr uint32_t FOLLOWUP_GAP_MS = 200;
-  static constexpr int FOLLOWUP_COUNT = 6;
+  static constexpr int FOLLOWUP_COUNT_POLL = 6;   // status poll needs many rounds to elicit STATUS
+  static constexpr int FOLLOWUP_COUNT_CMD = 2;    // movement commands: fewer to reduce sibling cross-talk
 
   // Queued status poll — process one motor at a time with full TX/RX
   // cycling between each, so motors get proper follow-ups.
@@ -593,10 +599,11 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->followup_action_ = action;
     this->followup_value_ = value;
     this->followup_is_command_ = is_command;
-    this->followup_remaining_ = FOLLOWUP_COUNT;
-    this->followup_total_ = FOLLOWUP_COUNT;
+    int count = is_command ? FOLLOWUP_COUNT_CMD : FOLLOWUP_COUNT_POLL;
+    this->followup_remaining_ = count;
+    this->followup_total_ = count;
     this->followup_next_ms_ = millis() + FOLLOWUP_GAP_MS;
-    ESP_LOGD(TAG, "Scheduled %d follow-ups", FOLLOWUP_COUNT);
+    ESP_LOGD(TAG, "Scheduled %d follow-ups", count);
   }
 
   // Single preamble followed by multiple command packets, each with its own
@@ -635,10 +642,10 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     // group commands so each motor gets TX/RX cycling for STATUS.
     if (!pkts.empty()) {
       this->followup_group_pkts_ = pkts;
-      this->followup_group_remaining_ = FOLLOWUP_COUNT;
+      this->followup_group_remaining_ = FOLLOWUP_COUNT_CMD;
       this->followup_next_ms_ = millis() + FOLLOWUP_GAP_MS;
       ESP_LOGD(TAG, "GROUP: scheduled %d follow-ups for %d motors",
-               FOLLOWUP_COUNT, static_cast<int>(pkts.size()));
+               FOLLOWUP_COUNT_CMD, static_cast<int>(pkts.size()));
     }
   }
 
