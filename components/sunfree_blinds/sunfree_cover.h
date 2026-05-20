@@ -115,6 +115,7 @@ inline void SunfreeHub::register_cover(SunfreeCover *cover) {
 }
 
 inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float rssi) {
+  this->rx_packet_count_++;
   this->last_rssi_ = rssi;
 
   // Expire stale piggyback
@@ -126,7 +127,8 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
 
   // Scan timeout is now handled in loop()
 
-  ESP_LOGD(TAG, "RX (%d bytes, rssi=%.0f)", data.size(), rssi);
+  ESP_LOGD(TAG, "RX #%u (%d bytes, rssi=%.0f)",
+           this->rx_packet_count_, data.size(), rssi);
 
   if (data.size() < 2 || data[0] != 0x91) return;
 
@@ -136,11 +138,20 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
     return;
   }
 
+  this->rx_valid_count_++;
+
   if (pkt_len == 12) {
     // ACK from motor
+    this->rx_ack_count_++;
     SunfreeResponse resp{};
     if (parse_ack(data.data(), data.size(), resp) && resp.valid) {
       std::string mid = format_motor_id(resp.motor_id);
+      std::string hid = format_motor_id(resp.hub_id);
+      this->last_rx_motor_ = mid;
+      char buf[80];
+      snprintf(buf, sizeof(buf), "ACK %s→%s flags=0x%02x",
+               mid.c_str(), hid.c_str(), resp.ack_flags);
+      this->last_rx_info_ = buf;
       ESP_LOGI(TAG, "RX ACK from %s flags=0x%02x rssi=%.0f",
                mid.c_str(), resp.ack_flags, rssi);
 
@@ -169,12 +180,22 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
       }
     } else {
       ESP_LOGW(TAG, "ACK parse_fail rssi=%.0f", rssi);
+      this->last_rx_info_ = "ACK parse_fail";
     }
 
   } else if (pkt_len == 16) {
     // Command (overheard from Tuya hub or other device)
+    this->rx_cmd_count_++;
     SunfreePacket pkt{};
     if (parse_command(data.data(), data.size(), pkt) && pkt.valid) {
+      std::string mid = format_motor_id(pkt.motor_id);
+      std::string hid = format_motor_id(pkt.hub_id);
+      this->last_rx_motor_ = mid;
+      char buf[120];
+      snprintf(buf, sizeof(buf), "CMD h=%s m=%s a=%d v=%d s=0x%02x",
+               hid.c_str(), mid.c_str(), static_cast<int>(pkt.action),
+               pkt.value, pkt.seq);
+      this->last_rx_info_ = buf;
       this->set_overheard_seq(pkt.seq);
     } else {
       uint8_t extracted[16];
@@ -193,6 +214,9 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
       if (!is_beacon) is_beacon = (d4[14] == 0xEE);
 
       if (is_beacon) {
+        this->rx_beacon_count_++;
+        this->rx_cmd_count_--;
+
         // n=3 decrypt for proper address extraction (bytes 3-6)
         uint8_t d3[16];
         memcpy(d3, extracted, 16);
@@ -202,6 +226,7 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
         memcpy(d3, w3, 12);
 
         ESP_LOGI(TAG, "BEACON rssi=%.0f", rssi);
+        this->last_rx_info_ = "BEACON";
 
         if (this->scan_active_) {
           this->pairing_status_ = "BEACON FOUND";
@@ -210,6 +235,7 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
         }
       } else {
         ESP_LOGW(TAG, "CMD parse_fail rssi=%.0f", rssi);
+        this->last_rx_info_ = "CMD parse_fail";
       }
     }
 
@@ -219,11 +245,16 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
 
   } else if (pkt_len == 24) {
     // Status report from motor
+    this->rx_status_count_++;
     SunfreeResponse resp{};
     if (parse_status(data.data(), data.size(), resp) && resp.valid) {
       std::string mid = format_motor_id(resp.motor_id);
-      ESP_LOGI(TAG, "RX STATUS %s pos=%d bat=%d%% state=%d rssi=%.0f",
-               mid.c_str(), resp.position, resp.battery, resp.state, rssi);
+      this->last_rx_motor_ = mid;
+      char buf[80];
+      snprintf(buf, sizeof(buf), "STATUS %s pos=%d bat=%d%% state=%d",
+               mid.c_str(), resp.position, resp.battery, resp.state);
+      this->last_rx_info_ = buf;
+      ESP_LOGI(TAG, "RX %s rssi=%.0f", buf, rssi);
 
       auto it = this->covers_.find(mid);
       if (it != this->covers_.end()) {
@@ -262,10 +293,17 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
       ESP_LOGW(TAG, "STATUS parse_fail: dec[0]=0x%02x hub=%02x%02x%02x%02x motor=%02x%02x%02x%02x",
                dec6[0], dec6[3], dec6[4], dec6[5], dec6[6],
                dec6[7], dec6[8], dec6[9], dec6[10]);
+
+      char buf[80];
+      snprintf(buf, sizeof(buf), "STATUS fail 0x%02x h=%02x%02x%02x%02x m=%02x%02x%02x%02x",
+               dec6[0], dec6[3], dec6[4], dec6[5], dec6[6],
+               dec6[7], dec6[8], dec6[9], dec6[10]);
+      this->last_rx_info_ = buf;
     }
 
   } else if (pkt_len == 20) {
     // Motor pairing response (20 bytes: n=4 encrypted + 4 cleartext)
+    this->rx_beacon_count_++;
     SunfreePairingResponse pr{};
     if (parse_pairing_response(data.data(), data.size(), pr)) {
       std::string night = format_motor_id(pr.night_id);
@@ -273,6 +311,11 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
       std::string hid = format_motor_id(pr.hub_id);
       ESP_LOGI(TAG, "PAIRING RESPONSE: night=%s day=%s hub=%s rssi=%.0f",
                night.c_str(), day.c_str(), hid.c_str(), rssi);
+
+      char buf[120];
+      snprintf(buf, sizeof(buf), "PAIRED night=%s day=%s hub=%s",
+               night.c_str(), day.c_str(), hid.c_str());
+      this->last_rx_info_ = buf;
 
       // Add both motor IDs to discovered list
       auto add_discovered = [this](const std::string &id) {
@@ -351,3 +394,6 @@ inline void SunfreeHub::send_group_command(const std::string &group,
 
 }  // namespace sunfree_blinds
 }  // namespace esphome
+
+// Web UI — must come after SunfreeHub and SunfreeCover are fully defined
+#include "sunfree_web.h"

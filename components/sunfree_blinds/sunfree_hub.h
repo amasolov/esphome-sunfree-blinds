@@ -3,6 +3,7 @@
 #include "esphome/core/log.h"
 #include "esphome/core/preferences.h"
 #include "esphome/components/api/custom_api_device.h"
+#include "esphome/components/web_server_base/web_server_base.h"
 #include "esphome/components/cc1101/cc1101.h"
 #include "sunfree_protocol.h"
 #include <map>
@@ -31,6 +32,7 @@ class SunfreeCover;
 class SunfreeHub : public Component, public api::CustomAPIDevice {
  public:
   void set_cc1101(cc1101::CC1101Component *radio) { this->radio_ = radio; }
+  void set_web_base(web_server_base::WebServerBase *base) { this->web_base_ = base; }
   void set_hub_id(const std::string &id) {
     parse_motor_id(id, this->hub_id_);
     this->hub_id_from_yaml_ = true;
@@ -53,6 +55,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
                      {"group", "action"});
     ESP_LOGI(TAG, "Registered services: send_config, group_command");
 
+    if (this->web_base_) this->setup_web_();
   }
 
   void loop() override {
@@ -280,6 +283,15 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   }
 
   std::string get_hub_id_str() const { return format_motor_id(this->hub_id_); }
+  std::string get_motors_json();  // implemented in sunfree_web.h
+
+  uint32_t get_rx_packet_count() const { return this->rx_packet_count_; }
+  uint32_t get_rx_valid_count() const { return this->rx_valid_count_; }
+  uint32_t get_rx_status_count() const { return this->rx_status_count_; }
+  uint32_t get_rx_ack_count() const { return this->rx_ack_count_; }
+  uint32_t get_rx_cmd_count() const { return this->rx_cmd_count_; }
+  const std::string &get_last_rx_motor() const { return this->last_rx_motor_; }
+  const std::string &get_last_rx_info() const { return this->last_rx_info_; }
   const std::string &get_piggyback_status() const { return this->piggyback_status_; }
 
   void on_cc1101_packet(const std::vector<uint8_t> &data, float rssi);
@@ -303,6 +315,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
   bool is_scanning() const { return this->scan_active_; }
   const std::string &get_pairing_status() const { return this->pairing_status_; }
+  uint32_t get_rx_beacon_count() const { return this->rx_beacon_count_; }
 
   // Proactive pairing: now just an alias for start_scan().
   // The loop() continuously sends solicitation + listens during scan.
@@ -346,6 +359,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
  protected:
   cc1101::CC1101Component *radio_{nullptr};
+  web_server_base::WebServerBase *web_base_{nullptr};
   uint8_t hub_id_[4]{};
   bool hub_id_from_yaml_{false};
   uint8_t seq_{0x80};
@@ -398,7 +412,16 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   static constexpr uint32_t POLL_COOLDOWN_MS = 500;
 
 
+  // Diagnostic counters
+  uint32_t rx_packet_count_{0};
+  uint32_t rx_valid_count_{0};
+  uint32_t rx_status_count_{0};
+  uint32_t rx_ack_count_{0};
+  uint32_t rx_cmd_count_{0};
+  uint32_t rx_beacon_count_{0};
   float last_rssi_{0.0f};
+  std::string last_rx_motor_{"none"};
+  std::string last_rx_info_{"waiting"};
   std::string piggyback_status_{"idle"};
 
   static const char *action_name_(uint8_t action) {
@@ -693,6 +716,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->radio_->begin_rx();
   }
 
+  void setup_web_();  // implemented in sunfree_web.h
 };
 
 }  // namespace sunfree_blinds
