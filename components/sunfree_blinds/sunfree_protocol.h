@@ -24,6 +24,7 @@ enum class SunfreeCmd : uint8_t {
   GOTO_FAVOURITE = 0x0F,
   SET_LIMIT = 0x21,
   SET_DIRECTION = 0x22,
+  STATUS_QUERY = 0x2A,
   DISCOVERY = 0x2D,
 };
 
@@ -205,6 +206,34 @@ inline std::vector<uint8_t> build_stop_packet(const uint8_t *hub_id, const uint8
   payload[14] = 0x03;
 
   return build_tx_frame(payload, 15);
+}
+
+// Hub→motor ACK: 12-byte n=3 XXTEA packet (on-air type 0x03).
+// The Tuya hub sends this after receiving a motor STATUS report;
+// the motor expects the ACK to continue sending additional reports.
+inline std::vector<uint8_t> build_ack_packet(const uint8_t *hub_id, const uint8_t *motor_id,
+                                              uint8_t seq, uint8_t flags = 0x00,
+                                              bool swap = false) {
+  uint8_t plain[12];
+  plain[0] = 0x08;
+  plain[1] = seq;
+  plain[2] = 0x01;
+  if (swap) {
+    memcpy(plain + 3, motor_id, 4);
+    memcpy(plain + 7, hub_id, 4);
+  } else {
+    memcpy(plain + 3, hub_id, 4);
+    memcpy(plain + 7, motor_id, 4);
+  }
+  plain[11] = flags;
+
+  uint32_t words[3];
+  memcpy(words, plain, 12);
+  xxtea_encrypt(words, 3, SUNFREE_KEY);
+
+  uint8_t payload[12];
+  memcpy(payload, words, 12);
+  return build_tx_frame(payload, 12);
 }
 
 // Generic n=4 command: 16 bytes fully XXTEA-encrypted.
