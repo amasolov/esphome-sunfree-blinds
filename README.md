@@ -124,23 +124,23 @@ api:
 sunfree_blinds:
   id: sunfree_hub
   cc1101_id: cc1101_radio
-  # hub_id: "a2fb24d8"  # optional -- set to migrate from Tuya hub
+  # hub_id: "aabbccdd"  # optional -- set to migrate from Tuya hub
   groups:
     - name: "Bedroom Night"
-      motor_ids: ["15471d42", "15493b42"]
+      motor_ids: ["11223344", "11556677"]
     - name: "Bedroom Day"
-      motor_ids: ["14471d42", "14493b42"]
+      motor_ids: ["10223344", "10556677"]
 
 cover:
   - platform: sunfree_blinds
     name: "Bedroom Left Night"
-    motor_id: "15471d42"
+    motor_id: "11223344"
     battery:
       name: "Bedroom Left Night Battery"
 
   - platform: sunfree_blinds
     name: "Bedroom Left Day"
-    motor_id: "14471d42"
+    motor_id: "10223344"
     battery:
       name: "Bedroom Left Day Battery"
 ```
@@ -195,9 +195,9 @@ sunfree_blinds:
   cc1101_id: cc1101_radio
   groups:
     - name: "Living Room Day"
-      motor_ids: ["04250e5b", "092e4265", "09302365"]
+      motor_ids: ["11aabb01", "11aabb02", "11aabb03"]
     - name: "Living Room Night"
-      motor_ids: ["05250e5b", "0a2e4265", "0a302365"]
+      motor_ids: ["12aabb01", "12aabb02", "12aabb03"]
 ```
 
 Call group commands via the HA service:
@@ -220,7 +220,7 @@ YAML changes needed.
 ```yaml
 service: esphome.sunfree_blinds_send_config
 data:
-  motor_id: "15471d42"
+  motor_id: "11223344"
   action_type: "direction_reverse"
 ```
 
@@ -261,7 +261,7 @@ and stored in NVS (Non-Volatile Storage):
 - **Lost on** full flash erase (`--erase-flash`) -- motors must be re-paired
 
 To see your hub ID, add a text sensor (shown above). Once known, pin it
-in the YAML as a backup: `hub_id: "a2fb24d8"`.
+in the YAML as a backup: `hub_id: "aabbccdd"`.
 
 ### Migrating from a Tuya AC801B hub
 
@@ -275,10 +275,10 @@ and trigger the Tuya hub to send a command. The ESP32 logs overheard
 commands:
 
 ```
-[sunfree] RX CMD h=15241342 m=04250e5b a=4 v=100 s=0x30
+[sunfree] RX CMD h=aabbccdd m=11223344 a=4 v=100 s=0x30
 ```
 
-Here `h=15241342` is the hub ID and `m=04250e5b` is the motor ID.
+Here `h=aabbccdd` is the hub ID and `m=11223344` is the motor ID.
 
 **Option B: SWD debug dump** (requires hardware debugger)
 
@@ -289,8 +289,8 @@ Connect a debugger to the hub's MCU (HDSC HC32L170) and read SRAM at
 
 Each Sunfree unit has **two** rollers with sequential motor IDs:
 
-- **Night roller**: lower first byte (e.g. `04250e5b`)
-- **Day roller**: higher first byte (e.g. `05250e5b`)
+- **Night roller**: lower first byte (e.g. `05xxxx5b`)
+- **Day roller**: higher first byte (e.g. `04xxxx5b`)
 
 ## PSRAM configuration
 
