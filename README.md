@@ -361,12 +361,6 @@ For full protocol details, see [docs/PROTOCOL.md](docs/PROTOCOL.md).
 - Use `invert_position: true` on the cover if your motor direction is
   reversed
 
-### API connection errors (`errno=128`)
-
-- Check for stale `esphome logs` processes (`ps ax | grep esphome`)
-- Kill any zombie log sessions -- each holds an API connection
-- The device supports 3-4 concurrent API clients maximum
-
 ## Project structure
 
 ```
