@@ -1,4 +1,7 @@
 #pragma once
+#ifndef USE_WEBSERVER_BASE
+// Web UI disabled — web_server_base not available
+#else
 // Included from bottom of sunfree_cover.h — all types must be complete.
 #include "esphome/components/web_server_base/web_server_base.h"
 
@@ -288,3 +291,4 @@ inline std::string SunfreeHub::get_motors_json() {
 
 }  // namespace sunfree_blinds
 }  // namespace esphome
+#endif  // USE_WEBSERVER_BASE
