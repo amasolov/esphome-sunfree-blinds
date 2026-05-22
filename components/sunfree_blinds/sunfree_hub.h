@@ -99,14 +99,18 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
       this->poll_cooldown_until_ = now + POLL_COOLDOWN_MS;
     }
 
-    // Group follow-ups: retransmit all group commands per round
+    // Group follow-ups: rebuild each motor's packet with a FRESH seq
+    // so motors don't deduplicate.  Same fix as single-motor follow-ups.
     if (this->followup_group_remaining_ > 0 && this->followup_remaining_ <= 0 &&
         now >= this->followup_next_ms_) {
+      int round = FOLLOWUP_COUNT_GROUP - this->followup_group_remaining_ + 1;
       ESP_LOGD(TAG, "Group follow-up %d/%d (%d motors)",
-               FOLLOWUP_COUNT_CMD - this->followup_group_remaining_ + 1,
-               FOLLOWUP_COUNT_CMD,
-               static_cast<int>(this->followup_group_pkts_.size()));
-      for (auto &pkt : this->followup_group_pkts_) {
+               round, FOLLOWUP_COUNT_GROUP,
+               static_cast<int>(this->followup_group_entries_.size()));
+      for (auto &entry : this->followup_group_entries_) {
+        uint8_t seq = this->next_seq();
+        auto pkt = this->build_command_packet_(entry.motor_id, entry.action,
+                                                entry.position, seq);
         this->transmit_command_only_(pkt, 1);
       }
       this->followup_group_remaining_--;
@@ -406,14 +410,21 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   uint8_t followup_action_{0};
   uint8_t followup_value_{0};
   bool followup_is_command_{false};
-  std::vector<std::vector<uint8_t>> followup_group_pkts_;
+
+  struct GroupEntry {
+    uint8_t motor_id[4];
+    uint8_t action;
+    uint8_t position;
+  };
+  std::vector<GroupEntry> followup_group_entries_;
   uint32_t followup_next_ms_{0};
   int followup_remaining_{0};
   int followup_total_{0};
   int followup_group_remaining_{0};
   static constexpr uint32_t FOLLOWUP_GAP_MS = 200;
-  static constexpr int FOLLOWUP_COUNT_POLL = 6;   // status poll needs many rounds to elicit STATUS
-  static constexpr int FOLLOWUP_COUNT_CMD = 2;    // movement commands: fewer to reduce sibling cross-talk
+  static constexpr int FOLLOWUP_COUNT_POLL = 6;    // status poll needs many rounds to elicit STATUS
+  static constexpr int FOLLOWUP_COUNT_CMD = 2;     // single-motor movement commands
+  static constexpr int FOLLOWUP_COUNT_GROUP = 4;   // group commands: more rounds for reliability
 
   // Queued status poll — process one motor at a time with full TX/RX
   // cycling between each, so motors get proper follow-ups.
@@ -525,7 +536,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // alignment with the CC1101's internal 40 kbps clock.
   // Static TX buffer avoids heap allocation during the critical-section
   // bit-bang, preventing heap corruption that crashes the SPI driver.
-  static constexpr int TX_BUF_MAX_ = 1100;
+  static constexpr int TX_BUF_MAX_ = 1600;
   uint8_t tx_buf_[TX_BUF_MAX_];
 
   void bitbang_tx_(int total) {
@@ -619,15 +630,19 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // Single preamble followed by multiple command packets, each with its own
   // sync word.  All motors are awake from the WOR preamble so they all
   // receive their command within milliseconds of each other.
+  // The command block is transmitted TWICE for redundancy — if a motor's
+  // WOR wake-up catches the tail of its first packet, the second copy
+  // provides another chance.
   void transmit_group_with_preamble_(std::vector<std::vector<uint8_t>> &pkts) {
-    static constexpr int PREAMBLE_BYTES = 800;  // 160ms WOR preamble (matches original Tuya hub)
+    static constexpr int PREAMBLE_BYTES = 800;
     static constexpr int GAP_BYTES = 20;
+    static constexpr int REPEAT_COPIES = 2;
 
-    int payload_total = 0;
+    int block_bytes = 0;
     for (auto &pkt : pkts) {
-      payload_total += 4 + (static_cast<int>(pkt.size()) - 2) + GAP_BYTES;
+      block_bytes += 4 + (static_cast<int>(pkt.size()) - 2) + GAP_BYTES;
     }
-    int total = PREAMBLE_BYTES + payload_total + 10;
+    int total = PREAMBLE_BYTES + (block_bytes * REPEAT_COPIES) + 10;
     if (total > TX_BUF_MAX_) {
       ESP_LOGE(TAG, "GROUP TX stream too large: %d > %d", total, TX_BUF_MAX_);
       return;
@@ -635,27 +650,28 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 
     memset(this->tx_buf_, 0xAA, total);
     int p = PREAMBLE_BYTES;
-    for (auto &pkt : pkts) {
-      this->tx_buf_[p++] = 0x53; this->tx_buf_[p++] = 0x52;
-      this->tx_buf_[p++] = 0x4A; this->tx_buf_[p++] = 0x44;
-      for (int i = 2; i < static_cast<int>(pkt.size()); i++) this->tx_buf_[p++] = pkt[i];
-      p += GAP_BYTES;  // already 0xAA from memset
+    for (int copy = 0; copy < REPEAT_COPIES; copy++) {
+      for (auto &pkt : pkts) {
+        this->tx_buf_[p++] = 0x53; this->tx_buf_[p++] = 0x52;
+        this->tx_buf_[p++] = 0x4A; this->tx_buf_[p++] = 0x44;
+        for (int i = 2; i < static_cast<int>(pkt.size()); i++) this->tx_buf_[p++] = pkt[i];
+        p += GAP_BYTES;
+      }
     }
 
-    ESP_LOGD(TAG, "GROUP WOR: %d bytes (%dms), %d motors",
-             total, total * 8 / 40, static_cast<int>(pkts.size()));
+    ESP_LOGI(TAG, "GROUP WOR: %d bytes (%dms), %d motors x%d copies",
+             total, total * 8 / 40, static_cast<int>(pkts.size()), REPEAT_COPIES);
 
     this->bitbang_tx_(total);
 
-    // Schedule follow-ups for all motors in the group.  The first
-    // follow-up fires after FOLLOWUP_GAP_MS; it retransmits all
-    // group commands so each motor gets TX/RX cycling for STATUS.
-    if (!pkts.empty()) {
-      this->followup_group_pkts_ = pkts;
-      this->followup_group_remaining_ = FOLLOWUP_COUNT_CMD;
+    // Schedule follow-ups with FRESH seq on each round (motors deduplicate
+    // by seq, so we must rebuild packets).
+    if (!this->followup_group_entries_.empty()) {
+      this->followup_group_remaining_ = FOLLOWUP_COUNT_GROUP;
       this->followup_next_ms_ = millis() + FOLLOWUP_GAP_MS;
       ESP_LOGD(TAG, "GROUP: scheduled %d follow-ups for %d motors",
-               FOLLOWUP_COUNT_CMD, static_cast<int>(pkts.size()));
+               FOLLOWUP_COUNT_GROUP,
+               static_cast<int>(this->followup_group_entries_.size()));
     }
   }
 

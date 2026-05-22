@@ -386,6 +386,7 @@ inline void SunfreeHub::send_group_command(const std::string &group,
   }
 
   std::vector<std::vector<uint8_t>> pkts;
+  this->followup_group_entries_.clear();
   for (auto *c : targets) {
     uint8_t seq = this->next_seq();
     uint8_t eff_action = action;
@@ -396,6 +397,13 @@ inline void SunfreeHub::send_group_command(const std::string &group,
       else if (action == ACTION_POSITION) eff_position = 100 - position;
     }
     pkts.push_back(this->build_command_packet_(c->get_motor_id(), eff_action, eff_position, seq));
+
+    GroupEntry ge{};
+    memcpy(ge.motor_id, c->get_motor_id(), 4);
+    ge.action = eff_action;
+    ge.position = eff_position;
+    this->followup_group_entries_.push_back(ge);
+
     ESP_LOGI(TAG, "GROUP[%s] TX %s seq=0x%02x motor=%s%s",
              group.empty() ? "all" : group.c_str(), action_name_(eff_action),
              seq, c->get_motor_id_str().c_str(),
