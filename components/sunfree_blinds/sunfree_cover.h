@@ -33,7 +33,7 @@ class SunfreeCover : public cover::Cover, public Component {
     traits.set_supports_position(true);
     traits.set_supports_stop(true);
     traits.set_supports_toggle(false);
-    traits.set_is_assumed_state(true);
+    traits.set_is_assumed_state(false);
     return traits;
   }
 
