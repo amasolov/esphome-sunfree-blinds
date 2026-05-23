@@ -635,7 +635,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   // provides another chance.
   void transmit_group_with_preamble_(std::vector<std::vector<uint8_t>> &pkts) {
     static constexpr int PREAMBLE_BYTES = 800;
-    static constexpr int GAP_BYTES = 20;
+    static constexpr int GAP_BYTES = 80;   // 16ms at 40kbps — gives motor time to process/ACK
     static constexpr int REPEAT_COPIES = 2;
 
     int block_bytes = 0;
