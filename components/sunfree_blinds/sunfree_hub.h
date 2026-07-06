@@ -119,6 +119,37 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
       }
     }
 
+    // ACK-verified retransmission: re-send to motors that never confirmed.
+    // One straggler per pass, only while no follow-up TX is in flight
+    // (follow-up state is a shared single slot).
+    if (!this->pending_acks_.empty() && !this->scan_active_ &&
+        this->followup_remaining_ <= 0 && this->followup_group_remaining_ <= 0 &&
+        now >= this->retry_cooldown_until_) {
+      for (auto it = this->pending_acks_.begin(); it != this->pending_acks_.end(); ++it) {
+        if (static_cast<int32_t>(now - it->deadline_ms) < 0) continue;
+        if (it->retries_left == 0) {
+          ESP_LOGW(TAG, "Motor %s NEVER ACKED %s after %d retries — giving up",
+                   format_motor_id(it->motor_id).c_str(),
+                   action_name_(it->action), ACK_MAX_RETRIES);
+          this->pending_acks_.erase(it);
+          break;
+        }
+        it->retries_left--;
+        this->retry_count_total_++;
+        ESP_LOGW(TAG, "No ACK from %s — RETRY %s (attempt %d/%d, total retries %u)",
+                 format_motor_id(it->motor_id).c_str(), action_name_(it->action),
+                 ACK_MAX_RETRIES - it->retries_left, ACK_MAX_RETRIES,
+                 this->retry_count_total_);
+        uint8_t seq = this->next_seq();
+        auto pkt = this->build_command_packet_(it->motor_id, it->action, it->position, seq);
+        this->transmit_with_preamble_(pkt);
+        this->schedule_followups_(it->motor_id, it->action, it->position, true);
+        it->deadline_ms = now + ACK_TIMEOUT_MS;
+        this->retry_cooldown_until_ = now + RETRY_SPACING_MS;
+        break;  // one retry per loop pass
+      }
+    }
+
     if (!this->scan_active_) return;
 
     // Check scan timeout
@@ -157,6 +188,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
              format_motor_id(motor_id).c_str());
     this->transmit_with_preamble_(pkt);
     this->schedule_followups_(motor_id, action, position, true);
+    this->arm_ack_watch_(motor_id, action, position);
 
     // Also arm auto-piggyback as fallback for deep-sleeping motors
     this->arm_piggyback_(motor_id, action, position);
@@ -297,6 +329,8 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   std::string get_motors_json();  // implemented in sunfree_web.h
 #endif
 
+  uint32_t get_retry_count() const { return this->retry_count_total_; }
+  uint32_t get_pending_ack_count() const { return this->pending_acks_.size(); }
   uint32_t get_rx_packet_count() const { return this->rx_packet_count_; }
   uint32_t get_rx_valid_count() const { return this->rx_valid_count_; }
   uint32_t get_rx_status_count() const { return this->rx_status_count_; }
@@ -431,6 +465,65 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   std::vector<std::string> poll_queue_;
   uint32_t poll_cooldown_until_{0};
   static constexpr uint32_t POLL_COOLDOWN_MS = 500;
+
+  // ACK-verified retransmission.  Motors ACK every command they hear, but
+  // TX was fire-and-forget: all redundancy (2x burst copies + follow-ups)
+  // happens within ~1s, which a motor sleeping through the WOR window
+  // misses entirely — observed as "one blind stayed in the previous mode"
+  // (group commands especially, since they never armed the piggyback).
+  // Every movement command arms a pending-ACK watch; an ACK or STATUS from
+  // the motor clears it; loop() re-sends unicast with the full wake
+  // preamble to motors that never confirmed, a few seconds apart.
+  // Retries are BOUNDED (~15s worst case per motor) on purpose: the
+  // day/night rollers are mechanically coupled, so a command deferred by
+  // minutes (piggyback-style) could fire after the sibling roller settled
+  // and drag it out of position.  Re-sends are safe if the ACK (not the
+  // command) was lost: targets are absolute positions, so a motor already
+  // at target doesn't move.
+  struct PendingAck {
+    uint8_t motor_id[4];
+    uint8_t action;
+    uint8_t position;
+    uint32_t deadline_ms;
+    uint8_t retries_left;
+  };
+  std::vector<PendingAck> pending_acks_;
+  uint32_t retry_cooldown_until_{0};
+  uint32_t retry_count_total_{0};
+  static constexpr uint32_t ACK_TIMEOUT_MS = 4000;    // burst+follow-ups ~1s, ACK expected well within this
+  static constexpr uint32_t RETRY_SPACING_MS = 1500;  // between straggler re-sends
+  static constexpr uint8_t ACK_MAX_RETRIES = 2;
+
+  void arm_ack_watch_(const uint8_t *motor_id, uint8_t action, uint8_t position) {
+    if (action == ACTION_STOP) return;  // STOP doubles as a status poll — don't retry-spam it
+    for (auto &e : this->pending_acks_) {
+      if (memcmp(e.motor_id, motor_id, 4) == 0) {
+        // Latest command wins (e.g. blackout's night open → night close)
+        e.action = action;
+        e.position = position;
+        e.deadline_ms = millis() + ACK_TIMEOUT_MS;
+        e.retries_left = ACK_MAX_RETRIES;
+        return;
+      }
+    }
+    PendingAck e{};
+    memcpy(e.motor_id, motor_id, 4);
+    e.action = action;
+    e.position = position;
+    e.deadline_ms = millis() + ACK_TIMEOUT_MS;
+    e.retries_left = ACK_MAX_RETRIES;
+    this->pending_acks_.push_back(e);
+  }
+
+  void clear_ack_watch_(const uint8_t *motor_id) {
+    for (auto it = this->pending_acks_.begin(); it != this->pending_acks_.end(); ++it) {
+      if (memcmp(it->motor_id, motor_id, 4) == 0) {
+        ESP_LOGD(TAG, "ACK watch cleared for %s", format_motor_id(it->motor_id).c_str());
+        this->pending_acks_.erase(it);
+        return;
+      }
+    }
+  }
 
 
   // Diagnostic counters

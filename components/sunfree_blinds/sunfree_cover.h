@@ -180,6 +180,9 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
         it->second->on_ack(resp);
       }
 
+      // Motor confirmed receipt — cancel any pending retransmission.
+      this->clear_ack_watch_(resp.motor_id);
+
       // Fire piggyback on ACK from target motor — the motor just finished
       // its ACK TX and is transitioning back to RX for follow-up packets.
       // Verify both motor_id AND hub_id to avoid triggering on hub→motor
@@ -298,6 +301,9 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
         ESP_LOGW(TAG, "Status from unknown motor %s", mid.c_str());
       }
 
+      // A STATUS report also proves the motor heard us — cancel retransmission.
+      this->clear_ack_watch_(resp.motor_id);
+
       // Auto-piggyback: fire queued command when target motor sends status report.
       // Verify hub_id to ensure this is a genuine motor→hub report.
       if (this->piggyback_armed_ &&
@@ -397,6 +403,8 @@ inline void SunfreeHub::send_group_command(const std::string &group,
       else if (action == ACTION_POSITION) eff_position = 100 - position;
     }
     pkts.push_back(this->build_command_packet_(c->get_motor_id(), eff_action, eff_position, seq));
+    // Watch for this motor's ACK; loop() re-sends unicast if it never confirms.
+    this->arm_ack_watch_(c->get_motor_id(), eff_action, eff_position);
 
     GroupEntry ge{};
     memcpy(ge.motor_id, c->get_motor_id(), 4);

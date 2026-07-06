@@ -270,7 +270,11 @@ inline std::string SunfreeHub::get_motors_json() {
              c->get_name().c_str(), pair.first.c_str(), c->position, op, bat);
     json += buf;
   }
-  json += "]}";
+  json += "],";
+  char cbuf[96];
+  snprintf(cbuf, sizeof(cbuf), "\"ack_retries\":%u,\"pending_acks\":%u}",
+           this->retry_count_total_, static_cast<unsigned>(this->pending_acks_.size()));
+  json += cbuf;
   return json;
 }
 
