@@ -14,6 +14,9 @@
 #include "rom/ets_sys.h"
 #include "esp_timer.h"
 #include "esp_random.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 
 namespace esphome {
 namespace sunfree_blinds {
@@ -55,6 +58,19 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->radio_->set_whitening(false);
     ESP_LOGI(TAG, "CC1101: CRC and whitening disabled for Sunfree protocol");
     this->build_solicitation_frame_();
+
+#ifndef CONFIG_FREERTOS_UNICORE
+    // Dedicated TX task pinned to core 1.  ESPHome's main loop and WiFi
+    // run on core 0, so the bit-bang's interrupt-disabled stretches no
+    // longer stall WiFi servicing or FreeRTOS ticks there.
+    this->tx_start_sem_ = xSemaphoreCreateBinary();
+    this->tx_done_sem_ = xSemaphoreCreateBinary();
+    if (xTaskCreatePinnedToCore(SunfreeHub::tx_task_trampoline_, "sunfree_tx",
+                                3072, this, 19, &this->tx_task_, 1) != pdPASS) {
+      ESP_LOGW(TAG, "TX task creation failed — falling back to inline TX");
+      this->tx_task_ = nullptr;
+    }
+#endif
 
     register_service(&SunfreeHub::on_send_config_, "send_config",
                      {"motor_id", "action_type"});
@@ -652,20 +668,28 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   static constexpr int TX_BUF_MAX_ = 1600;
   uint8_t tx_buf_[TX_BUF_MAX_];
 
-  void bitbang_tx_(int total) {
-    this->radio_->set_crc_enable(false);
-    this->radio_->set_whitening(false);
-    // TX at 433.933 MHz during pairing (motor WOR listens here),
-    // 433.950 MHz for normal commands (motor is already awake).
-    float tx_freq = this->scan_active_ ? 433933000.0f : 433950000.0f;
-    this->radio_->set_frequency(tx_freq);
-    this->radio_->set_packet_mode(false);
-    this->radio_->begin_tx();
+  // TX task state: the bit loop runs on a task pinned to core 1 so its
+  // interrupt-disabled stretches (up to ~51ms per 256-byte chunk) only
+  // affect core 1.  The main task blocks on tx_done_sem_ meanwhile, which
+  // keeps all CC1101 SPI access serialized in the caller's context.
+  TaskHandle_t tx_task_{nullptr};
+  SemaphoreHandle_t tx_start_sem_{nullptr};
+  SemaphoreHandle_t tx_done_sem_{nullptr};
+  int tx_total_{0};
 
-    gpio_set_direction(this->gdo0_pin_, GPIO_MODE_OUTPUT);
+  static void tx_task_trampoline_(void *param) {
+    auto *hub = static_cast<SunfreeHub *>(param);
+    while (true) {
+      xSemaphoreTake(hub->tx_start_sem_, portMAX_DELAY);
+      hub->bitbang_bits_(hub->tx_total_);
+      xSemaphoreGive(hub->tx_done_sem_);
+    }
+  }
 
-    ESP_LOGD(TAG, "WOR: %d bytes (%dms)", total, total * 8 / 40);
-
+  // The timing-critical bit loop.  Interrupts are disabled on the calling
+  // core to hold the 25us/bit symbol rate, released briefly every 256
+  // bytes so pending interrupts on this core can fire.
+  void bitbang_bits_(int total) {
     int64_t t0 = esp_timer_get_time();
     int bit_idx = 0;
 
@@ -687,6 +711,34 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     }
 
     portEXIT_CRITICAL(&mux);
+  }
+
+  void bitbang_tx_(int total) {
+    this->radio_->set_crc_enable(false);
+    this->radio_->set_whitening(false);
+    // TX at 433.933 MHz during pairing (motor WOR listens here),
+    // 433.950 MHz for normal commands (motor is already awake).
+    float tx_freq = this->scan_active_ ? 433933000.0f : 433950000.0f;
+    this->radio_->set_frequency(tx_freq);
+    this->radio_->set_packet_mode(false);
+    this->radio_->begin_tx();
+
+    gpio_set_direction(this->gdo0_pin_, GPIO_MODE_OUTPUT);
+
+    ESP_LOGD(TAG, "WOR: %d bytes (%dms)", total, total * 8 / 40);
+
+    int64_t t0 = esp_timer_get_time();
+
+    if (this->tx_task_ != nullptr) {
+      // Run the bit loop on core 1; block here (core 0 stays free for
+      // WiFi/lwIP tasks — only ESPHome's main loop pauses).
+      this->tx_total_ = total;
+      xSemaphoreGive(this->tx_start_sem_);
+      xSemaphoreTake(this->tx_done_sem_, portMAX_DELAY);
+    } else {
+      // Single-core build or task creation failed: run inline.
+      this->bitbang_bits_(total);
+    }
 
     // Restore GDO0 as input before touching SPI again
     gpio_set_direction(this->gdo0_pin_, GPIO_MODE_INPUT);

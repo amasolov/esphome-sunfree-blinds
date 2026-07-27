@@ -111,6 +111,33 @@ poll();setInterval(poll,3000);
 </script></body></html>
 )rawhtml";
 
+// Escape a string for embedding in a JSON string literal.  Cover and group
+// names come from user YAML and may contain quotes/backslashes/control chars.
+inline std::string json_escape(const std::string &s) {
+  std::string out;
+  out.reserve(s.size() + 8);
+  for (char c : s) {
+    switch (c) {
+      case '"': out += "\\\""; break;
+      case '\\': out += "\\\\"; break;
+      case '\b': out += "\\b"; break;
+      case '\f': out += "\\f"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case '\t': out += "\\t"; break;
+      default:
+        if (static_cast<unsigned char>(c) < 0x20) {
+          char buf[8];
+          snprintf(buf, sizeof(buf), "\\u%04x", c);
+          out += buf;
+        } else {
+          out += c;
+        }
+    }
+  }
+  return out;
+}
+
 class SunfreeWebHandler : public AsyncWebHandler {
  public:
   SunfreeWebHandler(SunfreeHub *hub) : hub_(hub) {}
@@ -260,7 +287,7 @@ inline void SunfreeHub::setup_web_() {
 
 inline std::string SunfreeHub::get_motors_json() {
   std::string json = "{\"hub_id\":\"" + format_motor_id(this->hub_id_) + "\",";
-  json += "\"pairing\":\"" + this->pairing_status_ + "\",";
+  json += "\"pairing\":\"" + json_escape(this->pairing_status_) + "\",";
   json += "\"discovered\":[";
   for (size_t i = 0; i < this->discovered_ids_.size(); i++) {
     if (i) json += ",";
@@ -272,7 +299,7 @@ inline std::string SunfreeHub::get_motors_json() {
   for (auto &grp : this->groups_) {
     if (!gfirst) json += ",";
     gfirst = false;
-    json += "{\"name\":\"" + grp.first + "\",\"motor_ids\":[";
+    json += "{\"name\":\"" + json_escape(grp.first) + "\",\"motor_ids\":[";
     bool mfirst = true;
     for (auto &mid : grp.second) {
       if (!mfirst) json += ",";
@@ -293,11 +320,12 @@ inline std::string SunfreeHub::get_motors_json() {
     float bat = -1;
     if (c->get_battery_sensor() && c->get_battery_sensor()->has_state())
       bat = c->get_battery_sensor()->state;
-    char buf[256];
+    char buf[96];
     snprintf(buf, sizeof(buf),
-             "{\"name\":\"%s\",\"id\":\"%s\",\"position\":%.3f,\"operation\":\"%s\",\"battery\":%.0f}",
-             c->get_name().c_str(), pair.first.c_str(), c->position, op, bat);
-    json += buf;
+             "\"position\":%.3f,\"operation\":\"%s\",\"battery\":%.0f}",
+             c->position, op, bat);
+    json += "{\"name\":\"" + json_escape(c->get_name().c_str()) + "\",\"id\":\"" +
+            pair.first + "\"," + buf;
   }
   json += "],";
   char cbuf[96];
