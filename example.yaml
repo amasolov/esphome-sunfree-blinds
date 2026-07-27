@@ -80,6 +80,8 @@ cc1101:
 sunfree_blinds:
   id: sunfree_hub
   cc1101_id: cc1101_radio
+  # Must match the cc1101 gdo0_pin above (used for direct TX). Default: 4.
+  # gdo0_pin: 4
   # hub_id: "aabbccdd"
   groups:
     - name: "Bedroom Night"

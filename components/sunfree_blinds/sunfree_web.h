@@ -2,6 +2,7 @@
 #ifdef USE_WEBSERVER_BASE
 // Included from bottom of sunfree_cover.h — all types must be complete.
 #include "esphome/components/web_server_base/web_server_base.h"
+#include <cctype>
 
 namespace esphome {
 namespace sunfree_blinds {
@@ -175,19 +176,47 @@ class SunfreeWebHandler : public AsyncWebHandler {
         return;
       }
 
+      for (auto &ch : motor) ch = static_cast<char>(::tolower(ch));
       uint8_t mid[4];
-      parse_motor_id(motor, mid);
+      if (!parse_motor_id(motor, mid)) {
+        request->send(400, "application/json", "{\"error\":\"invalid motor id\"}");
+        return;
+      }
+
+      // Movement commands go through the cover entity when one is configured,
+      // so invert_position is honoured and HA state stays in sync.  Fall back
+      // to a raw hub command for unconfigured motors (e.g. just discovered).
+      SunfreeCover *cover = this->hub_->get_cover(motor);
 
       if (action == "open") {
-        this->hub_->send_command(mid, ACTION_OPEN);
+        if (cover != nullptr) {
+          cover->make_call().set_command_open().perform();
+        } else {
+          this->hub_->send_command(mid, ACTION_OPEN);
+        }
       } else if (action == "close") {
-        this->hub_->send_command(mid, ACTION_CLOSE);
+        if (cover != nullptr) {
+          cover->make_call().set_command_close().perform();
+        } else {
+          this->hub_->send_command(mid, ACTION_CLOSE);
+        }
       } else if (action == "stop") {
-        this->hub_->send_command(mid, ACTION_STOP);
+        if (cover != nullptr) {
+          cover->make_call().set_command_stop().perform();
+        } else {
+          this->hub_->send_command(mid, ACTION_STOP);
+        }
       } else if (action == "position") {
         std::string val = this->get_arg_(request, "value");
-        uint8_t pos = val.empty() ? 0 : static_cast<uint8_t>(std::atoi(val.c_str()));
-        this->hub_->send_command(mid, ACTION_POSITION, pos);
+        int pos = val.empty() ? 0 : std::atoi(val.c_str());
+        if (pos < 0) pos = 0;
+        if (pos > 100) pos = 100;
+        if (cover != nullptr) {
+          // The UI slider sends percent-closed; cover position is 1.0 = open.
+          cover->make_call().set_position(1.0f - pos / 100.0f).perform();
+        } else {
+          this->hub_->send_command(mid, ACTION_POSITION, static_cast<uint8_t>(pos));
+        }
       } else if (action == "direction_forward") {
         this->hub_->send_config(mid, static_cast<uint8_t>(SunfreeCmd::SET_DIRECTION), DIR_FORWARD);
       } else if (action == "direction_reverse") {
