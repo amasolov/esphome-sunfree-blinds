@@ -38,16 +38,19 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   void set_web_base(web_server_base::WebServerBase *base) { this->web_base_ = base; }
 #endif
   void set_hub_id(const std::string &id) {
-    parse_motor_id(id, this->hub_id_);
+    if (!parse_motor_id(id, this->hub_id_)) {
+      ESP_LOGE(TAG, "Invalid hub_id '%s' — must be 8 hex chars; ignoring", id.c_str());
+      return;
+    }
     this->hub_id_from_yaml_ = true;
   }
+  void set_gdo0_pin(uint8_t pin) { this->gdo0_pin_ = static_cast<gpio_num_t>(pin); }
 
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
 
   void setup() override {
     this->init_hub_id_();
     ESP_LOGI(TAG, "Hub ID: %s", format_motor_id(this->hub_id_).c_str());
-    ESP_LOGI(TAG, "Registered %d cover(s)", this->covers_.size());
     this->radio_->set_crc_enable(false);
     this->radio_->set_whitening(false);
     ESP_LOGI(TAG, "CC1101: CRC and whitening disabled for Sunfree protocol");
@@ -62,6 +65,16 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 #ifdef USE_WEBSERVER_BASE
     if (this->web_base_) this->setup_web_();
 #endif
+  }
+
+  // Runs after all components' setup(), so the cover count is accurate here
+  // (covers register at a later setup priority than the hub).
+  void dump_config() override {
+    ESP_LOGCONFIG(TAG, "Sunfree Hub:");
+    ESP_LOGCONFIG(TAG, "  Hub ID: %s", format_motor_id(this->hub_id_).c_str());
+    ESP_LOGCONFIG(TAG, "  GDO0 TX pin: %d", static_cast<int>(this->gdo0_pin_));
+    ESP_LOGCONFIG(TAG, "  Covers: %u", static_cast<unsigned>(this->covers_.size()));
+    ESP_LOGCONFIG(TAG, "  Groups: %u", static_cast<unsigned>(this->groups_.size()));
   }
 
   void loop() override {
@@ -175,6 +188,12 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
   }
 
   void register_cover(SunfreeCover *cover);
+
+  // Look up a registered cover by its lowercase-hex motor ID (nullptr if none).
+  SunfreeCover *get_cover(const std::string &motor_id) {
+    auto it = this->covers_.find(motor_id);
+    return it == this->covers_.end() ? nullptr : it->second;
+  }
 
   void set_swap_fields(bool swap) { this->swap_fields_ = swap; }
   bool get_swap_fields() const { return this->swap_fields_; }
@@ -408,6 +427,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
 #ifdef USE_WEBSERVER_BASE
   web_server_base::WebServerBase *web_base_{nullptr};
 #endif
+  gpio_num_t gdo0_pin_{GPIO_NUM_4};
   uint8_t hub_id_[4]{};
   bool hub_id_from_yaml_{false};
   uint8_t seq_{0x80};
@@ -642,7 +662,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     this->radio_->set_packet_mode(false);
     this->radio_->begin_tx();
 
-    gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
+    gpio_set_direction(this->gdo0_pin_, GPIO_MODE_OUTPUT);
 
     ESP_LOGD(TAG, "WOR: %d bytes (%dms)", total, total * 8 / 40);
 
@@ -657,7 +677,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
       for (int bit = 7; bit >= 0; bit--) {
         int64_t target = t0 + static_cast<int64_t>(bit_idx) * 25;
         while (esp_timer_get_time() < target) {}
-        gpio_set_level(GPIO_NUM_4, (byte >> bit) & 1);
+        gpio_set_level(this->gdo0_pin_, (byte >> bit) & 1);
         bit_idx++;
       }
       if ((b & 0xFF) == 0xFF) {
@@ -669,7 +689,7 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     portEXIT_CRITICAL(&mux);
 
     // Restore GDO0 as input before touching SPI again
-    gpio_set_direction(GPIO_NUM_4, GPIO_MODE_INPUT);
+    gpio_set_direction(this->gdo0_pin_, GPIO_MODE_INPUT);
 
     // Get back into RX as fast as possible -- the motor's pairing response
     // is a short burst that can arrive within milliseconds of our TX ending.

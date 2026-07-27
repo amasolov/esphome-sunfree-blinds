@@ -13,7 +13,10 @@ class SunfreeCover : public cover::Cover, public Component {
  public:
   void set_hub(SunfreeHub *hub) { this->hub_ = hub; }
   void set_motor_id(const std::string &id) {
-    parse_motor_id(id, this->motor_id_);
+    if (!parse_motor_id(id, this->motor_id_)) {
+      ESP_LOGE("sunfree", "Invalid motor_id '%s' — must be 8 hex chars", id.c_str());
+      return;
+    }
     this->motor_id_str_ = id;
   }
   void set_invert_position(bool invert) { this->invert_position_ = invert; }
@@ -24,8 +27,12 @@ class SunfreeCover : public cover::Cover, public Component {
 
   void setup() override {
     this->hub_->register_cover(this);
-    ESP_LOGI("sunfree", "Cover '%s' motor_id=%s", this->get_name().c_str(),
-             this->motor_id_str_.c_str());
+  }
+
+  void dump_config() override {
+    LOG_COVER("", "Sunfree Cover", this);
+    ESP_LOGCONFIG("sunfree", "  Motor ID: %s", this->motor_id_str_.c_str());
+    ESP_LOGCONFIG("sunfree", "  Invert position: %s", YESNO(this->invert_position_));
   }
 
   cover::CoverTraits get_traits() override {
@@ -75,8 +82,10 @@ class SunfreeCover : public cover::Cover, public Component {
 
   void on_ack(const SunfreeResponse &resp) {
     ESP_LOGI("sunfree", "ACK for %s flags=0x%02x", this->motor_id_str_.c_str(), resp.ack_flags);
-    if (resp.ack_flags == 0x40) {
+    if (resp.ack_flags == 0x40 &&
+        this->current_operation != cover::COVER_OPERATION_IDLE) {
       this->current_operation = cover::COVER_OPERATION_IDLE;
+      this->publish_state();
     }
   }
 
@@ -181,7 +190,11 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
       }
 
       // Motor confirmed receipt — cancel any pending retransmission.
-      this->clear_ack_watch_(resp.motor_id);
+      // Only if it ACKed *us*: when coexisting with a Tuya hub, a motor
+      // ACKing the Tuya hub says nothing about our command being heard.
+      if (memcmp(resp.hub_id, this->hub_id_, 4) == 0) {
+        this->clear_ack_watch_(resp.motor_id);
+      }
 
       // Fire piggyback on ACK from target motor — the motor just finished
       // its ACK TX and is transitioning back to RX for follow-up packets.
@@ -302,7 +315,10 @@ inline void SunfreeHub::on_cc1101_packet(const std::vector<uint8_t> &data, float
       }
 
       // A STATUS report also proves the motor heard us — cancel retransmission.
-      this->clear_ack_watch_(resp.motor_id);
+      // Same hub_id guard as the ACK path (Tuya hub coexistence).
+      if (memcmp(resp.hub_id, this->hub_id_, 4) == 0) {
+        this->clear_ack_watch_(resp.motor_id);
+      }
 
       // Auto-piggyback: fire queued command when target motor sends status report.
       // Verify hub_id to ensure this is a genuine motor→hub report.

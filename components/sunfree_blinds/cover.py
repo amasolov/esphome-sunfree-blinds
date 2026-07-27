@@ -7,7 +7,7 @@ from esphome.const import (
     UNIT_PERCENT,
     ICON_BATTERY,
 )
-from . import sunfree_ns, SunfreeHub
+from . import sunfree_ns, SunfreeHub, hex_id
 
 DEPENDENCIES = ["sunfree_blinds"]
 
@@ -21,7 +21,7 @@ SunfreeCover = sunfree_ns.class_("SunfreeCover", cover.Cover, cg.Component)
 CONFIG_SCHEMA = cover.cover_schema(SunfreeCover).extend(
     {
         cv.GenerateID(CONF_SUNFREE_HUB_ID): cv.use_id(SunfreeHub),
-        cv.Required(CONF_MOTOR_ID): cv.string_strict,
+        cv.Required(CONF_MOTOR_ID): hex_id,
         cv.Optional(CONF_INVERT_POSITION, default=False): cv.boolean,
         cv.Optional(CONF_BATTERY): sensor.sensor_schema(
             unit_of_measurement=UNIT_PERCENT,
