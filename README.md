@@ -232,16 +232,19 @@ data:
 | `set_close_limit` | Save current position as the close limit |
 | `save_favourite` | Save current position as the favourite |
 | `goto_favourite` | Move to the saved favourite position |
-| `request_status` | Poll a motor for battery and position (sends STOP; an idle motor may only ACK) |
-| `status_query` | Protocol status poll (ACTION 0x2A); does not stop a moving motor |
+| `request_status` | Sends a STOP with follow-ups. An idle motor only ACKs it; there is no known way to read an idle motor's position |
 
 Use `motor_id: "all"` with `action_type: "request_status"` to poll every
 motor sequentially.
 
 ## Status polling
 
-The component polls motors for battery and position using TX/RX cycling
-that mimics the original Tuya hub:
+Motors report battery and position (STATUS) only while and after they
+move. **An idle motor cannot be polled**: neither a STOP nor the 0x2A
+pairing command gets a STATUS, and the original Tuya hub has no poll
+either (see `docs/PROTOCOL.md`). After a controller reboot positions read
+100% until each motor next moves. The component uses TX/RX cycling that
+mimics the original Tuya hub:
 
 - Each command is followed by 2-6 retransmissions with fresh sequence
   numbers, spaced 200 ms apart
@@ -250,8 +253,7 @@ that mimics the original Tuya hub:
 - Sequential polling with 500 ms cooldown between motors prevents
   cross-talk
 
-Battery and position update automatically after any open/close/stop
-command. Use `request_status` to poll on demand.
+Battery and position update automatically after any movement command.
 
 ## Hub ID
 
@@ -350,8 +352,8 @@ For full protocol details, see [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ### Battery percentage not updating
 
-- Battery is reported in STATUS packets sent after commands
-- Use `request_status` to poll a specific motor or all motors
+- Battery is reported only in STATUS packets a motor sends when it moves
+- It reads unknown after a controller reboot until that motor next moves
 - The motor must be paired and responding to commands
 
 ### Position values seem inverted
