@@ -308,17 +308,14 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     } else if (action_type == "request_status") {
       this->request_status(mid);
       return;
-    } else if (action_type == "status_query") {
-      // The protocol's own status poll (ACTION 0x2A, n=4), as the Tuya hub
-      // sends after pairing.  request_status above sends a STOP instead,
-      // and on 2026-11-09 an idle motor answered that STOP (unicast and
-      // group) with ACKs only, never a STATUS, so positions could only be
-      // learned by moving a blind.  send_config() schedules the 6-round
-      // TX/RX follow-up cycle that STATUS elicitation needs (PROTOCOL.md
-      // "TX/RX cycling").  Unlike STOP this cannot halt a moving roller.
-      action = static_cast<uint8_t>(SunfreeCmd::STATUS_QUERY);
-      value = 0x00;
     } else {
+      // Deliberately no "status_query" (ACTION 0x2A): it was added in #5 and
+      // removed after tests and a disassembly of the original hub's RF MCU
+      // (HC32L170) showed 0x2A/0x2C are the post-pairing handshake, not a
+      // poll.  An idle motor answers them with an ACK only.  The original
+      // hub has no way to read an idle motor's position either.  Never add
+      // ACTION 0x2B: in the hub firmware it is "delete sub device" (unbind).
+      // See docs/PROTOCOL.md "Actions found in the hub firmware".
       ESP_LOGW(TAG, "send_config: unknown action_type '%s'", action_type.c_str());
       return;
     }

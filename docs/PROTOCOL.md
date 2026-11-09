@@ -47,8 +47,9 @@ LEN  SEQ  CMD  ADDRESS  FLG  00   DP   ACT  VAL
 | 0x21 | SET_LIMIT | 0x03 | n=4 (16 enc) | Save current position as **favourite** |
 | 0x22 | SET_DIRECTION | 0x00 | n=4 (16 enc) | Motor direction = **forward** |
 | 0x22 | SET_DIRECTION | 0x01 | n=4 (16 enc) | Motor direction = **reverse** |
-| 0x2A | STATUS_QUERY | 0x00 | n=4 (16 enc) | Poll motor for STATUS (battery+position) |
-| 0x2C | CONFIG_QUERY | 0x00 | n=4 (16 enc) | Post-pairing config query (observed, untested) |
+| 0x2A | (pairing handshake) | none | 15-byte, value omitted | Sent once by the hub right after it adds a sub-device. **Not a status poll** (see below) |
+| 0x2B | **DELETE SUB DEVICE** | none / 0x00 | | **Unbinds the motor from the hub. Never send.** |
+| 0x2C | (pairing handshake) | none | 15-byte, value omitted | Sent once by the hub after 0x2A when adding a sub-device |
 | 0x2D | DISCOVERY | n/a | n=3 (12 enc + 3 clear) | Pairing discovery (broadcast) |
 
 ## Encryption scope
@@ -283,11 +284,40 @@ Maximum 30 motor IDs per hub (firmware limit `0x1E` = 15 physical units).
 #### Post-pairing commands (observed from Tuya hub)
 
 After the initial discovery+response, the Tuya hub sends additional
-commands with actions 0x2A, 0x2C addressed to each motor ID. These
-trigger the motor to respond with ACKs and STATUS reports. Action 0x2A
-is used as a **status poll** — sending it at any time elicits a STATUS
-response containing battery + position. The ESP32 exposes this as the
-`request_status` HA service.
+commands with actions 0x2A, 0x2C addressed to each motor ID. These were
+once assumed to be a status poll. **They are not** (corrected 2026-11-09):
+
+- Tested: an idle motor answers 0x2A, a unicast STOP or a group STOP
+  with ACKs only, never a STATUS. Motors send STATUS only while and after
+  they actually move. No unsolicited/periodic STATUS was seen from 16
+  motors over a 27-minute idle window, nor over a further 20-minute
+  capture after motors had been moved and ACKed.
+- Disassembly of the original hub's RF MCU (HC32L170 flash dump):
+  0x2A and 0x2C are sent only from the "add sub dev" handler, right after
+  a motor is paired. No routine on a timer or behind any Tuya
+  command sends either one to a paired motor.
+
+### Actions found in the hub firmware
+
+Function `0x5fb0` builds `0B SEQ 01 <hub> <motor> 00 00 01 <action> [value]`;
+when the caller passes value `0xFF` the value byte is omitted (15-byte
+packet). A 20-slot queue (`0x6128` → `0x60d4`) feeds it. Tuya DP → action:
+
+| Tuya DP | Value | ACTION |
+|---------|-------|--------|
+| 1 (control) | 0 / 1 / 2 | 0x01 / 0x03 / 0x02 |
+| 1 (control) | 3 / 4 / 5 / 6 | 0x05 / 0x06 / 0x08 / 0x09 (unidentified) |
+| 1 (control) | 7 / 8 | 0x0F (goto favourite) / 0x03 |
+| 2 (percent_control) | 0-100 | 0x04 SET_POSITION |
+| 5 | | 0x22 SET_DIRECTION, 0x21 SET_LIMIT |
+| 104-109 | | 0x81-0x84 (control/position set for a second channel) |
+
+Commands from the Tuya Wi-Fi module to the RF MCU (UART cmd byte):
+0x01-0x03 info, 0x06/0x07 scan start/stop, 0x09 **delete sub device**
+(sends 0x2B), 0x0A/0x1D/0x1E OTA, 0x0C/0x16 DP control, 0x18 **delete
+all** (sends 0x2B to every motor), 0x60 BLE state. None reads a motor's
+position: the Tuya app showed the last position a motor reported after
+moving, exactly as this component does.
 
 #### Hub → Motor ACK
 
