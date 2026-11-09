@@ -308,6 +308,16 @@ class SunfreeHub : public Component, public api::CustomAPIDevice {
     } else if (action_type == "request_status") {
       this->request_status(mid);
       return;
+    } else if (action_type == "status_query") {
+      // The protocol's own status poll (ACTION 0x2A, n=4), as the Tuya hub
+      // sends after pairing.  request_status above sends a STOP instead,
+      // and on 2026-11-09 an idle motor answered that STOP (unicast and
+      // group) with ACKs only, never a STATUS, so positions could only be
+      // learned by moving a blind.  send_config() schedules the 6-round
+      // TX/RX follow-up cycle that STATUS elicitation needs (PROTOCOL.md
+      // "TX/RX cycling").  Unlike STOP this cannot halt a moving roller.
+      action = static_cast<uint8_t>(SunfreeCmd::STATUS_QUERY);
+      value = 0x00;
     } else {
       ESP_LOGW(TAG, "send_config: unknown action_type '%s'", action_type.c_str());
       return;

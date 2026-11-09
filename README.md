@@ -232,7 +232,8 @@ data:
 | `set_close_limit` | Save current position as the close limit |
 | `save_favourite` | Save current position as the favourite |
 | `goto_favourite` | Move to the saved favourite position |
-| `request_status` | Poll a motor for battery and position |
+| `request_status` | Poll a motor for battery and position (sends STOP; an idle motor may only ACK) |
+| `status_query` | Protocol status poll (ACTION 0x2A); does not stop a moving motor |
 
 Use `motor_id: "all"` with `action_type: "request_status"` to poll every
 motor sequentially.
