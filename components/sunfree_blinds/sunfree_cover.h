@@ -51,7 +51,6 @@ class SunfreeCover : public cover::Cover, public Component {
     }
     if (call.get_position().has_value()) {
       float target = *call.get_position();
-      float prev = this->position;
       // HA: 0.0=closed, 1.0=open.
       // Standard motor: 0=open, 100=closed.
       // Inverted motor: 0=closed, 100=open.
@@ -61,19 +60,80 @@ class SunfreeCover : public cover::Cover, public Component {
       } else {
         motor_pos = static_cast<uint8_t>((1.0f - target) * 100.0f);
       }
+      uint8_t action;
       if (motor_pos == 0) {
-        this->hub_->send_command(this->motor_id_, ACTION_OPEN);
+        action = ACTION_OPEN;
       } else if (motor_pos >= 100) {
-        this->hub_->send_command(this->motor_id_, ACTION_CLOSE);
+        action = ACTION_CLOSE;
       } else {
-        this->hub_->send_command(this->motor_id_, ACTION_POSITION, motor_pos);
+        action = ACTION_POSITION;
       }
-      this->position = target;
-      this->current_operation = (target > prev)
-                                    ? cover::COVER_OPERATION_OPENING
-                                    : cover::COVER_OPERATION_CLOSING;
-      this->publish_state();
+      // OPEN/CLOSE carry no position byte on air — keep sending 0 there.
+      this->hub_->send_command(this->motor_id_, action,
+                               action == ACTION_POSITION ? motor_pos : 0);
+      this->apply_command(action, motor_pos);
     }
+  }
+
+  // Watchdog for a lost final STATUS.  Observed in HA history: motors
+  // report STATUS ~2s after accepting a command — already carrying the
+  // *target* position and a moving state — and report again (state=0) on
+  // arrival.
+  // That arrival report is sometimes never received (radio busy with the
+  // next group burst, or simply lost), and nothing else ever moves the
+  // cover back to IDLE: covers sat in "opening"/"closing" for 5+ hours,
+  // so any HA wait_template on "not opening/closing" times out instead of
+  // completing.  After SETTLE_TIMEOUT_MS with no fresh motion report,
+  // assume the motor has arrived.  Position is left alone — the last
+  // STATUS (or the commanded target) is still the best estimate.
+  // We deliberately do NOT send a status poll here: the poll is a STOP,
+  // which would halt a motor that is in fact still travelling.
+  void loop() override {
+    if (this->current_operation == cover::COVER_OPERATION_IDLE) return;
+    if (millis() - this->last_motion_ms_ < SETTLE_TIMEOUT_MS) return;
+    ESP_LOGW("sunfree", "%s: no arrival STATUS within %us — marking idle at %d%%",
+             this->motor_id_str_.c_str(), static_cast<unsigned>(SETTLE_TIMEOUT_MS / 1000),
+             static_cast<int>(this->position * 100));
+    this->current_operation = cover::COVER_OPERATION_IDLE;
+    this->publish_state();
+  }
+
+  // Record a command that was just transmitted to this motor, so HA shows
+  // the target until the motor's own STATUS replaces it.  `action` and
+  // `motor_pos` are in MOTOR space, exactly as sent on air (i.e. after any
+  // invert_position flip), and are mapped back to HA space with the same
+  // conversion on_status() uses.
+  //
+  // Group commands used to compute this in HA space themselves and got the
+  // inverted case backwards: the action was flipped for the motor but the
+  // published target was not, so every inverted motor briefly reported the
+  // mirror of its target (position_25 showed 25% while heading to 75%,
+  // "open" showed closed).  STATUS corrected it seconds later, but anything
+  // reading current_position in that window — e.g. a script planning the
+  // next move — planned from the wrong side of the window.
+  void apply_command(uint8_t action, uint8_t motor_pos) {
+    if (action == ACTION_STOP) {
+      this->current_operation = cover::COVER_OPERATION_IDLE;
+      this->publish_state();
+      return;
+    }
+    if (action == ACTION_OPEN) {
+      motor_pos = 0;
+    } else if (action == ACTION_CLOSE) {
+      motor_pos = 100;
+    }
+    float prev = this->position;
+    float target = this->motor_to_ha_(motor_pos);
+    this->position = target;
+    if (target > prev) {
+      this->current_operation = cover::COVER_OPERATION_OPENING;
+    } else if (target < prev) {
+      this->current_operation = cover::COVER_OPERATION_CLOSING;
+    }
+    // target == prev: already there, the motor won't move — leave the
+    // operation as it was rather than claiming a "closing" that never ends.
+    this->last_motion_ms_ = millis();
+    this->publish_state();
   }
 
   const uint8_t *get_motor_id() const { return this->motor_id_; }
@@ -90,12 +150,7 @@ class SunfreeCover : public cover::Cover, public Component {
   }
 
   void on_status(uint8_t state, uint8_t motor_position, uint8_t battery) {
-    float ha_pos;
-    if (this->invert_position_) {
-      ha_pos = motor_position / 100.0f;
-    } else {
-      ha_pos = (100.0f - motor_position) / 100.0f;
-    }
+    float ha_pos = this->motor_to_ha_(motor_position);
     this->position = ha_pos;
 
     switch (state) {
@@ -104,9 +159,11 @@ class SunfreeCover : public cover::Cover, public Component {
         break;
       case 1:
         this->current_operation = cover::COVER_OPERATION_CLOSING;
+        this->last_motion_ms_ = millis();
         break;
       case 2:
         this->current_operation = cover::COVER_OPERATION_OPENING;
+        this->last_motion_ms_ = millis();
         break;
     }
     this->publish_state();
@@ -121,11 +178,23 @@ class SunfreeCover : public cover::Cover, public Component {
   }
 
  protected:
+  // Motor space (0..100) → HA space (0.0=closed, 1.0=open).
+  // Standard motor: 0=open, 100=closed.  Inverted motor: 0=closed, 100=open.
+  float motor_to_ha_(uint8_t motor_pos) const {
+    if (this->invert_position_) return motor_pos / 100.0f;
+    return (100.0f - motor_pos) / 100.0f;
+  }
+
+  // A full travel takes ~35s on these rollers; 60s leaves room for a slow
+  // motor on a low battery without leaving HA waiting much past arrival.
+  static constexpr uint32_t SETTLE_TIMEOUT_MS = 60000;
+
   SunfreeHub *hub_{nullptr};
   uint8_t motor_id_[4]{};
   std::string motor_id_str_;
   bool invert_position_{false};
   sensor::Sensor *battery_sensor_{nullptr};
+  uint32_t last_motion_ms_{0};
 };
 
 // Implementation of hub method that depends on SunfreeCover
@@ -435,27 +504,12 @@ inline void SunfreeHub::send_group_command(const std::string &group,
   }
   this->transmit_group_with_preamble_(pkts);
 
-  for (auto *c : targets) {
-    if (action == ACTION_STOP) {
-      c->current_operation = cover::COVER_OPERATION_IDLE;
-    } else {
-      float target_pos;
-      if (c->get_invert_position()) {
-        if (action == ACTION_OPEN) target_pos = 0.0f;
-        else if (action == ACTION_CLOSE) target_pos = 1.0f;
-        else target_pos = position / 100.0f;
-      } else {
-        if (action == ACTION_OPEN) target_pos = 1.0f;
-        else if (action == ACTION_CLOSE) target_pos = 0.0f;
-        else target_pos = 1.0f - (position / 100.0f);
-      }
-      float prev = c->position;
-      c->position = target_pos;
-      c->current_operation = (target_pos > prev)
-                                 ? cover::COVER_OPERATION_OPENING
-                                 : cover::COVER_OPERATION_CLOSING;
-    }
-    c->publish_state();
+  // Publish what each motor was actually told (the per-motor effective
+  // action/position recorded above), not the group-level request — see
+  // SunfreeCover::apply_command for why that distinction matters.
+  for (size_t i = 0; i < targets.size(); i++) {
+    const auto &ge = this->followup_group_entries_[i];
+    targets[i]->apply_command(ge.action, ge.position);
   }
 }
 
